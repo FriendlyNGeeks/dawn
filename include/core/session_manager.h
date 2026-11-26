@@ -35,10 +35,17 @@
 #include <time.h>
 
 #include "config/dawn_config.h"
+#include "core/conv_sync_point.h"
+#include "core/conv_turn_lease.h"
 #include "core/prompt_parts.h"  // For composed_prompt_t
-#include "core/text_filter.h"   // For cmd_tag_filter_state_t
+#include "core/text_filter.h"   // For cited_tag_filter_state_t
+#include "core/turn_origin.h"   // For TURN_ORIGIN_STOPPED_MAX
 #include "dawn_error.h"
 #include "llm/llm_interface.h"  // For session_llm_config_t
+
+/* Turns whose previews a session keeps counting: the confirm window and the
+ * turn itself (TURN_ORIGIN_UNASKED_QUIET_TURNS + 1, asserted where used). */
+#define SESSION_PREPARE_TURNS 4
 
 #define SESSION_PROVIDER_MAX 16
 #define SESSION_MAX_PROVIDERS 5 /* local + each cloud provider */
@@ -556,6 +563,15 @@ typedef struct session {
    // session, or a fresh chat before its first turn).
    _Atomic int64_t history_conversation_id;
 
+   // The stored state of that conversation the live history was built at
+   // (conv_sync_point.h): set where a history is loaded from the database or a
+   // turn holding the conversation ends on it, compared when a turn begins.
+   // Valid only while history_sync_conv is history_conversation_id (0 =
+   // unknown: the next turn builds the history again).  Guarded by
+   // history_mutex.
+   conv_sync_point_t history_sync;
+   int64_t history_sync_conv;
+
    // The running turn's own history (owned ref, guarded by history_mutex) and the
    // conversation it belongs to.  Set by session_turn_begin(): the turn pins the
    // live history when it holds the turn's conversation, and otherwise that
@@ -576,11 +592,19 @@ typedef struct session {
    char *turn_attached;            // the note naming an email the user attached to this
                                    // turn (session_turn_attach_email); NULL = none
    uint32_t turn_number;           // turns begun on this session (the running one's number)
-   bool turn_context_reset;        // the live history it wrote was reset under it (a clear)
-   char *turn_pending_user;        // persisted form of a user message not yet written
-   char *turn_pending_reply;       // the reply, likewise
-   char *unclaimed_user;           // an ended turn's unsaved exchange (see
-   char *unclaimed_reply;          // session_bind_created_conversation), and when it ended
+   // The running turn's conversation lease (conv_turn_lease.h): the token it
+   // holds leases under, the conversation it holds (0 none), and whether its
+   // wait for that lease was stopped, so the turn ends before its question is
+   // saved.  Guarded by history_mutex; released by the turn's end.
+   uint64_t turn_lease_token;
+   int64_t turn_lease_conv;
+   bool turn_unsent;
+   bool turn_stale_history;   // its catch-up failed: the history's sync point is unknown at its end
+   bool turn_context_reset;   // the live history it wrote was reset under it (a clear)
+   char *turn_pending_user;   // persisted form of a user message not yet written
+   char *turn_pending_reply;  // the reply, likewise
+   char *unclaimed_user;      // an ended turn's unsaved exchange (see
+   char *unclaimed_reply;     // session_bind_created_conversation), and when it ended
    struct json_object *unclaimed_reply_blocks;  // that reply's blocks (owned)
    time_t unclaimed_at;
    struct json_object *turn_reply;         // the turn's assistant reply (owned ref): its row id
@@ -611,12 +635,32 @@ typedef struct session {
    uint64_t turn_owner_token;
    uint64_t turn_outer_token;  // the begin thread's token before this turn  // the running turn's
                                // token (session_turn_token()), readable under history_mutex
+   // The last turns the user stopped mid-reply, newest first (session_stop.h); history_mutex
+   uint64_t stopped_turn_tokens[TURN_ORIGIN_STOPPED_MAX];
    // Recent device events (phone ringing, a call answered elsewhere, a proactive
    // alert), oldest first.  Posted by any thread; each turn's context takes the
    // ones its history hasn't been told (session_take_new_notices_locked).
    // Guarded by history_mutex.
    session_notice_t notices[SESSION_NOTICES_MAX];
    int notice_count;
+   // What DAWN posted into the conversation (a job's report) that this session
+   // has told its turns: posts in posts_told_conv up to posts_told_id
+   // (session_posts_take).  posts_told_by is the turn that told the last
+   // ones, those after posts_told_from (taken back with it: posts_told_prev).
+   // Guarded by history_mutex.
+   int64_t posts_told_conv;
+   int64_t posts_told_from;
+   int64_t posts_told_id;
+   int64_t posts_told_prev;
+   uint64_t posts_told_by;
+   // Previews not answered yet, counted by the turn they were shown in (slot
+   // turn % SESSION_PREPARE_TURNS, valid while .turn matches): DAWN stages
+   // nothing unasked while one may still be answered (turn_origin_note_prepare).
+   // Guarded by history_mutex.
+   struct {
+      uint32_t turn;
+      int open;
+   } prepares[SESSION_PREPARE_TURNS];
    // Facts "remember"ed during a turn whose conversation wasn't known yet; their
    // source is recorded once it is (see session_fact_source_t).  Guarded by
    // history_mutex.
@@ -649,10 +693,13 @@ typedef struct session {
    // the completed response and returns NULL), the finalized text is stashed HERE
    // instead of freed, so the persist-owning caller can still persist it post-
    // dispatch (the browser already stood down on will_persist → a naive free would
-   // lose the reply from the DB).  Owned by the session; the consuming caller takes
-   // it (sets NULL) + frees.  Cleared at turn start (llm_call_prepare) and freed at
-   // session teardown.  Single-writer per turn on the dispatch thread, read by the
-   // same worker after dispatch returns (turn-queue serialized) — no lock needed.
+   // lose the reply from the DB).  The reply is in the turn's history, as a
+   // completed reply is; the caller that armed will_persist_turn takes the stash
+   // and saves it as it saves a completed reply.  Owned by the session; the
+   // consuming caller takes it (sets NULL) + frees.  Cleared at turn start
+   // (llm_call_prepare) and freed at session teardown.  Single-writer per turn on
+   // the dispatch thread, read by the same worker after dispatch returns
+   // (turn-queue serialized) — no lock needed.
    char *cancelled_final_response;
 
    // The final answer's stash, written by the tool loop at every text-returning path
@@ -677,10 +724,14 @@ typedef struct session {
    //     taken by whichever writer saves the reply (session_take_reply_blocks), so the
    //     row carries its own turn's blocks and never an earlier turn's.  Also cleared
    //     at turn begin and turn end (session_turn_begin / _end).
+   //   - stopped_text: the reply as far as it had streamed when a stop cut the call (the
+   //     tool loop keeps it, with its blocks and reasoning in the fields above, only for a
+   //     turn whose caller saves its reply); taken by llm_call_finalize.
    struct {
       char *reasoning_json;
       struct json_object *blocks;
       struct json_object *reply_blocks;
+      char *stopped_text;
    } final_answer;
 
    // Whether THIS turn's step events (tool_call/tool_result) should be persisted
@@ -736,6 +787,21 @@ typedef struct session {
    // Single-writer (the research controller, set before a round dispatch, cleared
    // before synthesis); read on the dispatch thread at loop-params construction.
    int64_t input_token_ceiling;
+   // What a turn's last tool-loop call is for (llm_tool_loop_params_t.save_note):
+   // NULL, an answer; set, a save, and this note goes to the model before it.  A
+   // static string.  Single-writer (the research controller, between dispatches),
+   // read on the dispatch thread at loop-params construction and at finalize.
+   const char *turn_save_note;
+   // The loop is running a save step's tool batch: the policy lets only state-kind
+   // calls through (it narrows every caller to TOOL_CALLER_SAVE_STEP's row).  Set and
+   // cleared by the loop around the
+   // batch, read on the tool worker threads that share the session's context.
+   atomic_bool turn_save_step;
+   // This turn's reply comes from the local LLM though the session's selection is a
+   // cloud one (the cloud-to-local fallback): what reads the reply as the cloud
+   // model's (the <end_of_turn> cut) asks here first.  Set per turn by the
+   // completion entry point, read by the reply cleanup on the turn's threads.
+   atomic_bool turn_on_local_fallback;
 
    // Streaming metrics for UI visualization
    uint64_t stream_start_ms;     // Timestamp when LLM call started
@@ -747,10 +813,6 @@ typedef struct session {
    session_metrics_tracker_t metrics;
    pthread_mutex_t metrics_mutex;  // Protects metrics (lock level 4)
 
-   // Command tag filter state (strips <command>...</command> from stream)
-   // Used when native tool calling is disabled (legacy command tag mode)
-   cmd_tag_filter_state_t cmd_tag_filter;  // State for text_filter_command_tags()
-   bool cmd_tag_filter_bypass;             // Cached: true if native tools enabled (skip filtering)
    cited_tag_filter_state_t
        cited_tag_filter;  // Live-stream <cited>…</cited> strip (all stream paths)
 
@@ -877,10 +939,12 @@ typedef struct session {
 //   - session_teardown_flags:    session is being destroyed — abort + gate.
 // =============================================================================
 
-/** Abort this turn's generation (explicit Stop).  Does NOT gate emission. */
+/** Abort this turn's generation (explicit Stop).  Does NOT gate emission.
+ *  A turn still waiting for its conversation stops waiting at once. */
 static inline void session_cancel_turn(session_t *s) {
    if (s != NULL) {
       atomic_store(&s->cancel_requested, true);
+      conv_turn_lease_wake_session(s->session_id);
    }
 }
 
@@ -897,6 +961,7 @@ static inline void session_teardown_flags(session_t *s) {
       atomic_store(&s->cancel_requested, true);
       atomic_store(&s->disconnected, true);
       atomic_store(&s->compaction.cancel, true); /* its summarizer's transfer, too */
+      conv_turn_lease_wake_session(s->session_id);
    }
 }
 
@@ -1021,6 +1086,17 @@ static inline bool session_tools_suppressed(session_t *session) {
 static inline void session_set_input_token_ceiling(session_t *session, int64_t ceiling) {
    if (session != NULL) {
       session->input_token_ceiling = ceiling;
+   }
+}
+
+/**
+ * @brief Make the session's turns end on a save, not an answer (NULL: an answer).
+ *        @p note is static; the research controller sets it around a round's
+ *        dispatch and clears it after.
+ */
+static inline void session_set_turn_save_note(session_t *session, const char *note) {
+   if (session != NULL) {
+      session->turn_save_note = note;
    }
 }
 
@@ -1282,6 +1358,13 @@ dap2_capabilities_t session_capabilities(session_t *session);
  * rather than freed under its holder.
  */
 void session_destroy(uint32_t session_id);
+
+/**
+ * @brief Drop every queued WebUI response that names @p s, before it is freed,
+ *        so the send thread never reads a freed session.  The WebUI's is in
+ *        webui_send.c; session_manager.c has a weak no-op for builds without it.
+ */
+void webui_send_purge_session(const session_t *s);
 
 /**
  * @brief Record the credential that owns @p session: when it is created, never
@@ -1563,7 +1646,8 @@ bool session_add_turn_message(session_t *session, const char *role, const char *
  * As session_add_turn_message(session, "assistant", content), with the answer's
  * provider-neutral blocks (llm_turn_blocks.h) under LLM_TURN_BLOCKS_KEY, so each
  * provider replays it with its own reasoning.  @p blocks may be NULL (plain text);
- * the message takes a reference.
+ * the message takes a reference.  A reply the user stopped is marked as one
+ * (@p stopped: LLM_HISTORY_STOPPED_KEY), as its row is.
  *
  * @return true if appended
  */
@@ -1573,7 +1657,8 @@ void session_final_answer_clear(session_t *session);
 
 bool session_add_turn_assistant(session_t *session,
                                 const char *content,
-                                struct json_object *blocks);
+                                struct json_object *blocks,
+                                bool stopped);
 
 /**
  * @brief Check if session has user messages (beyond system prompt)
@@ -1827,11 +1912,13 @@ char *session_llm_call_with_tts_no_add(session_t *session,
 /**
  * @brief Set per-session LLM configuration
  *
- * Validates that requested provider has API key before applying.
+ * Stored as given: whether it can run (its provider's key) is checked per turn
+ * (session_turn_selection_problem()).  An unset selection (LLM_UNDEFINED) keeps
+ * following the default; the running turn's own copy is resolved.
  *
  * @param session Session to configure
  * @param config LLM configuration to apply
- * @return 0 on success, 1 if requested provider lacks API key
+ * @return 0 on success, 1 on a NULL argument
  *
  * @locks session->llm_config_mutex
  */
@@ -1842,25 +1929,65 @@ int session_set_llm_config(session_t *session, const session_llm_config_t *confi
  *
  * For a change the turn makes that must not outlive it (switch_llm on a
  * background turn, or a switch the conversation doesn't keep): the session's
- * settings, and so later turns, are untouched.  Same provider validation and
- * fallback as session_set_llm_config().
+ * settings, and so later turns, are untouched.
  *
- * @return 0 on success; 1 if no provider is usable or the caller isn't the
- *         running turn (its thread or a tool thread carrying its token)
+ * @return 0 on success; 1 if the caller isn't the running turn (its thread or a
+ *         tool thread carrying its token)
  *
  * @locks session->llm_config_mutex
  */
 int session_set_turn_llm_config(session_t *session, const session_llm_config_t *config);
 
 /**
- * @brief Get session's current LLM configuration
+ * @brief Get session's current LLM configuration, resolved
+ *
+ * The settings this thread's turn runs on (the running turn's own, else the
+ * session's), with an unset selection (LLM_UNDEFINED) replaced by
+ * the default one (llm_selection_resolve()).  What a turn, a status display or a
+ * check should read.
  *
  * @param session Session to query
  * @param config Output: copy of session's LLM config
  *
- * @locks session->llm_config_mutex
+ * @locks session->llm_config_mutex, then g_config_rwlock (not held together)
  */
 void session_get_llm_config(session_t *session, session_llm_config_t *config);
+
+/**
+ * @brief Whether the session has no LLM selection of its own (it follows the
+ *        dawn.toml default), so what is stored for it stores none either
+ *
+ * True for NULL.  @locks session->llm_config_mutex
+ */
+bool session_llm_follows_default(session_t *session);
+
+/**
+ * @brief The same settings as session_get_llm_config(), not resolved
+ *
+ * For a read-modify-write that stores the result back: an unset selection stays
+ * unset, so it keeps following the default.  A change that names a type, provider
+ * or model resolves it first (llm_selection_resolve()).
+ *
+ * @locks session->llm_config_mutex
+ */
+void session_get_llm_config_raw(session_t *session, session_llm_config_t *config);
+
+/**
+ * @brief Whether the LLM this turn would run on can run, and if not, why.
+ *
+ * Checks the config session_get_llm_config() returns on this thread (the running
+ * turn's, once its conversation is bound) with llm_selection_problem().  A surface
+ * that doesn't go through core_text_input_dispatch() calls it before saving the
+ * user's message; the dispatch's callers get the sentence in opts->refusal.
+ *
+ * @param session    Session to check
+ * @param[out] reason The sentence for the user (may be NULL)
+ * @param reason_len Size of @p reason
+ * @return 0 when it can run, 1 when it can't
+ *
+ * @locks session->llm_config_mutex, then g_config_rwlock (read), not nested
+ */
+int session_turn_selection_problem(session_t *session, char *reason, size_t reason_len);
 
 
 // =============================================================================
@@ -2015,15 +2142,6 @@ uint64_t session_turn_token(void);
 
 /** @brief Set this thread's turn token (0 clears).  See session_turn_token(). */
 void session_set_turn_token(uint64_t token);
-
-/**
- * @brief Pin the LLM settings session_get_llm_config() returns on this thread
- *
- * For work that outlives the turn it serves (async compaction): the turn's
- * settings, captured while it ran, keep applying after it ends.  @p config must
- * stay valid until cleared.  Pass NULL to clear.
- */
-void session_set_llm_config_override(const session_t *session, const session_llm_config_t *config);
 
 /* =============================================================================
  * Command Context Scope Guard (GCC/Clang cleanup attribute)

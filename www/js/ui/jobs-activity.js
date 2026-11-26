@@ -250,10 +250,39 @@ window.DawnJobsActivity = (function () {
 
    function renderGlobalPill() {
       var n = total();
-      renderPill(document.getElementById('global-jobs-pill'), n, plural(n));
+      var pill = document.getElementById('global-jobs-pill');
+      // A coding job waiting on the user says so on the pill.
+      var need = typeof DawnCodingEvents !== 'undefined' ? DawnCodingEvents.waitingCount() : 0;
+      renderPill(
+         pill,
+         n,
+         plural(n) + (need > 0 ? ', ' + need + ' need' + (need === 1 ? 's' : '') + ' you' : '')
+      );
+      if (pill) pill.classList.toggle('needs-you', need > 0);
+      /* It sits inside the jobs button: the button carries what it says (the
+       * badge keeps no tooltip of its own, which would hide the button's). */
+      var btn = document.getElementById('jobs-btn');
+      if (btn && pill) {
+         var label = n > 0 ? 'Background jobs: ' + pill.title : 'Open background jobs';
+         pill.removeAttribute('title');
+         pill.removeAttribute('aria-label');
+         btn.classList.toggle('has-jobs', n > 0);
+         btn.setAttribute('aria-label', label);
+         btn.title = n > 0 ? label : 'Background Jobs';
+      }
    }
 
    function renderAll() {
+      // What the active coding jobs wait on (asked once per change of the set),
+      // first: a job gone from the set takes its requests with it before the
+      // global pill counts them.
+      if (typeof DawnCodingEvents !== 'undefined') {
+         DawnCodingEvents.track(
+            Object.keys(jobs).map(function (k) {
+               return jobs[k];
+            })
+         );
+      }
       renderConvPill();
       renderGlobalPill();
    }
@@ -274,6 +303,8 @@ window.DawnJobsActivity = (function () {
       if (job.resumed) {
          unmarkTerminal(key);
       }
+      // A revise from another chat moves the job there: the old chat's badge drops it.
+      var prevParent = key in jobs ? jobs[key].parent_id : null;
       var trackedWentTerminal = false;
       if (!isActive(job.status)) {
          markTerminal(key);
@@ -298,10 +329,27 @@ window.DawnJobsActivity = (function () {
       if (trackedWentTerminal && typeof DawnJobs !== 'undefined' && DawnJobs.onJobTerminal) {
          DawnJobs.onJobTerminal(job);
       }
-      // Patch just the affected conversation's sidebar badge (no list re-render).
-      // A job's parent never changes, so the row carries the right parent whether
-      // it just joined the set or just left it. A rootless job (parent_id 0) has
-      // no conversation badge to patch.
+      // The other way across: a resume from chat or another tab takes a finished
+      // job back into the active set, so its History row goes.
+      if (
+         job.resumed &&
+         isActive(job.status) &&
+         typeof DawnJobs !== 'undefined' &&
+         DawnJobs.onJobResumed
+      ) {
+         DawnJobs.onJobResumed(job);
+      }
+      // Patch just the affected conversation's sidebar badge (no list re-render),
+      // and the one it left when a revise moved it. A rootless job (parent_id 0)
+      // has no conversation badge to patch.
+      if (
+         prevParent &&
+         prevParent !== job.parent_id &&
+         typeof DawnHistory !== 'undefined' &&
+         DawnHistory.updateConversationJobsBadge
+      ) {
+         DawnHistory.updateConversationJobsBadge(String(prevParent));
+      }
       if (
          job.parent_id &&
          typeof DawnHistory !== 'undefined' &&
@@ -341,6 +389,19 @@ window.DawnJobsActivity = (function () {
       }
    }
 
+   // jobs_snapshot with success:false: the server couldn't read the active set.
+   // Keep the set this tab already has (a wrong empty set would hide running
+   // jobs) and say the counts may be stale.
+   function snapshotFailed(error) {
+      console.warn('DawnJobsActivity: active-job snapshot failed:', error || '(no reason)');
+      if (typeof DawnToast !== 'undefined') {
+         DawnToast.show(
+            (error || "Couldn't read your background jobs.") + ' Job counts may be out of date.',
+            'error'
+         );
+      }
+   }
+
    // Every active job row, for surfaces that need more than a count (the jobs
    // panel). The ARRAY is a copy, but the rows are the store's own objects —
    // treat them as read-only. Mutating a row would silently desync the derived
@@ -354,6 +415,16 @@ window.DawnJobsActivity = (function () {
    // --- lifecycle hooks ------------------------------------------------------
 
    function handleReconnect() {
+      // Coding jobs' cards: what they wait on may have changed while away.
+      if (typeof DawnCodingEvents !== 'undefined') {
+         DawnCodingEvents.reconnected();
+      }
+      if (typeof DawnCodingGrants !== 'undefined') {
+         DawnCodingGrants.reconnected();
+      }
+      if (typeof DawnCodingViewer !== 'undefined') {
+         DawnCodingViewer.reconnected();
+      }
       if (typeof DawnWS !== 'undefined') {
          // A snapshot request opens a fresh reconciliation window, so drop the
          // terminal memory here. It exists only to suppress rows that finished
@@ -380,10 +451,15 @@ window.DawnJobsActivity = (function () {
       renderAll();
    }
 
+   if (typeof DawnCodingEvents !== 'undefined') {
+      DawnCodingEvents.onChange(renderGlobalPill);
+   }
+
    return {
       init: init,
       upsertJob: upsertJob,
       applySnapshot: applySnapshot,
+      snapshotFailed: snapshotFailed,
       handleReconnect: handleReconnect,
       // A jobs_invalidate nudge re-syncs exactly like a reconnect: re-request the
       // snapshot so the pill drops a removed (e.g. cascade-deleted) job.

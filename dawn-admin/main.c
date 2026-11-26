@@ -111,6 +111,11 @@ static void print_usage(const char *prog) {
    fprintf(stderr,
            "  memory reextract-status --user <user>\n"
            "                                       Report progress of last reextract run\n");
+   fprintf(stderr,
+           "  memory extract-range --user <u> --conv <id> --from <id> --to <id>\n"
+           "                    [--confirm]\n"
+           "                                       Extract rows behind a conversation's\n"
+           "                                       extraction cursor (dry run by default)\n");
    fprintf(stderr, "  memory superseded --user <u> [--grep <text>] [--limit N]\n"
                    "                                       List merged or replaced facts\n"
                    "  memory restore --user <u> --fact-id <id>\n"
@@ -553,7 +558,7 @@ static int print_session_callback(const admin_session_entry_t *session, void *ct
    char last_active[32];
    format_relative_time(session->last_activity, last_active, sizeof(last_active));
 
-   printf("  %-10s %-16s %-18s %s\n", session->token_prefix, session->username,
+   printf("  %-16s %-16s %-18s %s\n", session->token_prefix, session->username,
           session->ip_address[0] ? session->ip_address : "(local)", last_active);
 
    pctx->count++;
@@ -567,8 +572,8 @@ static int cmd_session_list(void) {
    }
 
    printf("\nActive Sessions:\n");
-   printf("  %-10s %-16s %-18s %s\n", "Token", "User", "IP Address", "Last Active");
-   printf("  ---------- ---------------- ------------------ -----------\n");
+   printf("  %-16s %-16s %-18s %s\n", "Token", "User", "IP Address", "Last Active");
+   printf("  ---------------- ---------------- ------------------ -----------\n");
 
    session_list_print_ctx_t ctx = { .count = 0 };
    admin_resp_code_t resp = admin_client_list_sessions(fd, print_session_callback, &ctx);
@@ -586,6 +591,11 @@ static int cmd_session_list(void) {
 static int cmd_session_revoke(const char *token_or_user, int is_user_mode) {
    if (!token_or_user || strlen(token_or_user) == 0) {
       fprintf(stderr, "Error: Token prefix or username is required\n");
+      return 1;
+   }
+   if (!is_user_mode && strlen(token_or_user) != ADMIN_SESSION_PREFIX_LEN) {
+      fprintf(stderr, "Error: Token prefix must be the %d characters 'session list' shows\n",
+              ADMIN_SESSION_PREFIX_LEN);
       return 1;
    }
 
@@ -1838,6 +1848,9 @@ int main(int argc, char *argv[]) {
 
       if (strcmp(subcmd, "superseded") == 0 || strcmp(subcmd, "restore") == 0) {
          return cmd_memory_facts(argc, argv); /* cmd_memory.c */
+      }
+      if (strcmp(subcmd, "extract-range") == 0) {
+         return cmd_memory_extract_range(argc, argv); /* cmd_memory.c */
       }
       if (strcmp(subcmd, "backfill-note-glosses") == 0) {
          if (argc < 4) {

@@ -100,7 +100,7 @@ typedef struct {
  * @brief Session entry from list response.
  */
 typedef struct {
-   char token_prefix[9];
+   char token_prefix[ADMIN_SESSION_PREFIX_LEN + 1];
    char username[64];
    int64_t created_at;
    int64_t last_activity;
@@ -192,7 +192,8 @@ admin_resp_code_t admin_client_list_sessions(int fd, admin_session_callback_t ca
  * @param fd             Socket file descriptor.
  * @param admin_user     Admin username for authorization.
  * @param admin_password Admin password for authorization.
- * @param token_prefix   8-character token prefix to revoke.
+ * @param token_prefix   ADMIN_SESSION_PREFIX_LEN-character token prefix to revoke
+ *                       (as `session list` prints it).
  *
  * @return Response code from daemon.
  */
@@ -735,6 +736,20 @@ admin_resp_code_t admin_client_memory_fact_superseded(int fd,
                                                       int limit,
                                                       char *response,
                                                       size_t resp_len);
+
+/**
+ * @brief Extract rows @p from..@p to of a conversation behind its extraction
+ *        cursor; a dry run (counts only) unless @p confirm
+ * @return Daemon response code
+ */
+admin_resp_code_t admin_client_memory_extract_range(int fd,
+                                                    const char *username,
+                                                    int64_t conversation_id,
+                                                    int64_t from,
+                                                    int64_t to,
+                                                    bool confirm,
+                                                    char *response,
+                                                    size_t resp_len);
 
 /** memory restore: bring a superseded fact back. */
 admin_resp_code_t admin_client_memory_fact_restore(int fd,

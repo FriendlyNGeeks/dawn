@@ -74,6 +74,14 @@ typedef struct {
 /* Forward declarations for vtable */
 extern const struct audio_decoder_vtable *mp3_get_vtable(void);
 
+/* libmpg123 prints tag and stream complaints ("No comment text", ...) to
+ * stderr; a library scan opens thousands of files, so keep it quiet */
+static void quiet_mpg123(mpg123_handle *mpg) {
+   if (mpg123_param(mpg, MPG123_ADD_FLAGS, MPG123_QUIET, 0) != MPG123_OK) {
+      OLOG_WARNING("mpg123: couldn't silence library messages: %s", mpg123_strerror(mpg));
+   }
+}
+
 /* =============================================================================
  * Vtable Implementation
  * ============================================================================= */
@@ -98,6 +106,7 @@ audio_decoder_t *mp3_decoder_open(const char *path) {
       free(handle);
       return NULL;
    }
+   quiet_mpg123(handle->mpg);
 
    /* Force output format to signed 16-bit for consistency */
    mpg123_format_none(handle->mpg);
@@ -233,7 +242,7 @@ int mp3_decoder_seek(audio_decoder_t *dec, uint64_t sample_pos) {
  *
  * mpg123 provides strings as mpg123_string with separate data and size.
  */
-static void copy_mpg123_string(char *dst, size_t dst_size, mpg123_string *src) {
+static void copy_mpg123_string(char *dst, size_t dst_size, const mpg123_string *src) {
    if (!dst || dst_size == 0)
       return;
    if (!src || !src->p || src->fill == 0) {
@@ -557,6 +566,16 @@ static void mp3_normalize_genre(char *dst, size_t dst_size, mpg123_string *src) 
  *
  * @return Year, or 0 if none found
  */
+/* An ID3v2 text frame by id ("TPE2"), or NULL */
+static const mpg123_string *mp3_v2_text(const mpg123_id3v2 *v2, const char *id) {
+   for (size_t i = 0; v2 && v2->text && i < v2->texts; i++) {
+      if (memcmp(v2->text[i].id, id, 4) == 0 && v2->text[i].text.p && v2->text[i].text.fill > 0) {
+         return &v2->text[i].text;
+      }
+   }
+   return NULL;
+}
+
 static uint32_t mp3_extract_year_v2(mpg123_id3v2 *v2) {
    if (!v2 || !v2->text) {
       return 0;
@@ -598,6 +617,7 @@ int mp3_get_metadata(const char *path, audio_metadata_t *metadata) {
    if (!mpg) {
       return AUDIO_DECODER_ERR_MEMORY;
    }
+   quiet_mpg123(mpg);
 
    /* We need to scan the file for ID3 tags */
    if (mpg123_open(mpg, path) != MPG123_OK) {
@@ -639,6 +659,14 @@ int mp3_get_metadata(const char *path, audio_metadata_t *metadata) {
                mp3_normalize_genre(metadata->genre, AUDIO_GENRE_STRING_MAX, v2->genre);
             /* v2->year is NULL for ID3v2.4 (TDRC); scan raw text frames. */
             metadata->year = mp3_extract_year_v2(v2);
+            /* Album artist, track and disc ("3/12") have no mpg123 field */
+            const mpg123_string *t;
+            if ((t = mp3_v2_text(v2, "TPE2")) != NULL)
+               copy_mpg123_string(metadata->album_artist, AUDIO_METADATA_STRING_MAX, t);
+            if ((t = mp3_v2_text(v2, "TRCK")) != NULL)
+               metadata->track_no = audio_metadata_parse_number(t->p);
+            if ((t = mp3_v2_text(v2, "TPOS")) != NULL)
+               metadata->disc_no = audio_metadata_parse_number(t->p);
          }
 
          /* Fall back to ID3v1 for any missing fields.

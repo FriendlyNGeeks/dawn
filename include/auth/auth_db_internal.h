@@ -68,7 +68,7 @@
  * DAWN_ENABLE_MCP_BRIDGE_TOOL / DAWN_ENABLE_CODE_PROJECTS. Gating them on a
  * feature flag would fork the schema timeline across binaries; do not do it.
  * (arch-A2) */
-#define AUTH_DB_SCHEMA_VERSION 113
+#define AUTH_DB_SCHEMA_VERSION 117
 
 /* v90 llm_usage_log: in the base schema (created on every start) and repeated by
  * the v90 migration step, so the two can't drift.  The binding_* columns (v91)
@@ -170,12 +170,16 @@
  * reaches the blocks after it on a migrated table (user rows hold none). */
 #define CONV_MSG_EMAIL_REF_COL(t) "CASE WHEN " #t ".role = 'user' THEN " #t ".email_ref END"
 
+/* A display read's stopped flag: whether the user stopped the reply before it
+ * finished (message_stopped, a primary-key lookup that never reads the row). */
+#define CONV_MSG_STOPPED_COL(t) \
+   "EXISTS (SELECT 1 FROM message_stopped s WHERE s.message_id = " #t ".id)"
+
 /* messages has foreign-key children (message_unprompted, which DAWN's own posts are
- * recorded in), so a rebuild of messages must keep every row id and run with
- * foreign_keys OFF and legacy_alter_table ON, never dropping the live table
- * while children point at it (as v98 does): otherwise the children are
- * cascade-deleted or left pointing at a renamed table, silently.  The test
- * test_messages_fk_children lists them. */
+ * recorded in, and message_stopped, the replies the user stopped), so a rebuild of messages must
+ * keep every row id and run with foreign_keys OFF and legacy_alter_table ON, never dropping the
+ * live table while children point at it (as v98 does): otherwise the children are cascade-deleted
+ * or left pointing at a renamed table, silently.  The test test_messages_fk_children lists them. */
 #define CONV_MESSAGES_TABLE_SQL                                                      \
    "CREATE TABLE IF NOT EXISTS messages ("                                           \
    "   id INTEGER PRIMARY KEY AUTOINCREMENT,"                                        \
@@ -494,6 +498,9 @@ typedef struct {
    sqlite3_stmt *stmt_msg_get_after;
    sqlite3_stmt *stmt_msg_get_llm;      /* replay read with llm_blocks (auth_db_messages.c) */
    sqlite3_stmt *stmt_msg_llm_sizes;    /* block sizes for the per-load budget */
+   sqlite3_stmt *stmt_msg_posted_after; /* DAWN's posts after a row (conv_db_posted_after) */
+   sqlite3_stmt *stmt_conv_sync_point;  /* what a reload is built from (conv_db_sync_point_get) */
+   sqlite3_stmt *stmt_prompt_blob_get;  /* a stored prompt blob's bytes, by hash */
    sqlite3_stmt *stmt_msg_gc_blocks;    /* blocks dropped below the watermark */
    sqlite3_stmt *stmt_msg_sweep_blocks; /* the same, across conversations */
    sqlite3_stmt *stmt_msg_bind_images;  /* a row's images made permanent with it */
@@ -776,7 +783,7 @@ typedef struct {
 } auth_db_stmt_def_t;
 
 /** How many statements auth_db_messages.c's table holds (checked there). */
-#define AUTH_DB_MESSAGES_STMT_COUNT 9
+#define AUTH_DB_MESSAGES_STMT_COUNT 12
 
 /**
  * @brief Prepare each statement in @p defs, in order.
@@ -952,28 +959,91 @@ int64_t auth_db_query_int64(sqlite3 *db, const char *sql);
    "COALESCE((SELECT MAX(m.id) FROM messages m WHERE m.conversation_id = " conv \
    " AND m.kind IS NULL), 0)"
 
+/* A turn context row @p m's content with a recalled memory's outside word
+ * taken out of its item headers: a fact's kind word ("told, outside"), a
+ * relation's, summary's or entity's ("memory_relation outside").  What's left
+ * saying "outside" is an item from an outside source. */
+/* clang-format off */
+#define CONV_TURN_CONTEXT_FOREIGN_SQL(m) \
+   "replace(replace(replace(replace(replace(" m ".content, '" OUTSIDE_MARKER_KIND_SUFFIX \
+   "', ''), '" OUTSIDE_MARKER_MEMORY_SOURCE "fact " OUTSIDE_MARKER_ITEM_KIND "', ''), '" \
+   OUTSIDE_MARKER_MEMORY_SOURCE "entity " OUTSIDE_MARKER_ITEM_KIND "', ''), '" \
+   OUTSIDE_MARKER_MEMORY_SOURCE "relation " OUTSIDE_MARKER_ITEM_KIND "', ''), '" \
+   OUTSIDE_MARKER_MEMORY_SOURCE "summary " OUTSIDE_MARKER_ITEM_KIND "', '')"
+/* clang-format on */
+
 /* The outside kind a stored row @p m (a messages row, by name) carries as
  * DAWN wrote it, NULL when none, by the live scan's rules
  * (memory_extraction_input.c) for what isn't a tool's result: one of DAWN's
- * posts, a turn context naming an item from outside ("[M3 source outside
- * YYYY-MM-DD]" or no date), a document attached to the user's message, a
- * background job's result, a device's relayed data (core/outside_markers.h). */
+ * posts, a turn context naming an item from an outside source ("[M3 source
+ * outside YYYY-MM-DD]" or no date; a recalled memory's "outside" doesn't
+ * count), a document attached to the user's message, a background job's
+ * result, a device's relayed data (core/outside_markers.h). */
 /* clang-format off */
 #define CONV_ROW_OUTSIDE_KIND_SQL(m) \
    "(CASE WHEN " m ".id IN (SELECT message_id FROM message_unprompted) THEN 7 " \
    "WHEN " m ".role != 'user' THEN NULL " \
-   "WHEN " m ".kind = 'turn_context' THEN (CASE WHEN " m ".content GLOB '* " \
-   OUTSIDE_MARKER_ITEM_KIND " [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]]*' OR instr(" m \
-   ".content, ' " OUTSIDE_MARKER_ITEM_KIND "]') > 0 THEN (CASE WHEN instr(" m ".content, '" \
-   OUTSIDE_MARKER_DOC_SOURCE " " OUTSIDE_MARKER_ITEM_KIND "') > 0 THEN 5 ELSE 7 END) END) " \
+   "WHEN " m ".kind = 'turn_context' THEN (CASE WHEN " CONV_TURN_CONTEXT_FOREIGN_SQL(m) \
+   " GLOB '* " OUTSIDE_MARKER_ITEM_KIND " [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]]*' OR " \
+   "instr(" CONV_TURN_CONTEXT_FOREIGN_SQL(m) ", ' " OUTSIDE_MARKER_ITEM_KIND "]') > 0 THEN " \
+   "(CASE WHEN instr(" m ".content, '" OUTSIDE_MARKER_DOC_SOURCE " " OUTSIDE_MARKER_ITEM_KIND \
+   "') > 0 THEN 5 WHEN instr(" m ".content, '" OUTSIDE_MARKER_CAL_SOURCE " " \
+   OUTSIDE_MARKER_ITEM_KIND "') > 0 THEN 9 ELSE 7 END) END) " \
    "WHEN " m ".kind IS NULL AND instr(" m ".content, '" OUTSIDE_MARKER_DOC_OPEN "') > 0 THEN 5 " \
    "WHEN substr(" m ".content, 1, length('" OUTSIDE_MARKER_JOB_UPDATE "')) = '" \
    OUTSIDE_MARKER_JOB_UPDATE "' THEN 3 " \
    "WHEN substr(" m ".content, 1, length('" OUTSIDE_MARKER_DEVICE_DATA "')) = '" \
    OUTSIDE_MARKER_DEVICE_DATA "' THEN 7 END)"
 /* clang-format on */
-_Static_assert(OUTSIDE_RESEARCH == 3 && OUTSIDE_DOCUMENT == 5 && OUTSIDE_OTHER == 7,
+_Static_assert(OUTSIDE_RESEARCH == 3 && OUTSIDE_DOCUMENT == 5 && OUTSIDE_OTHER == 7 &&
+                   OUTSIDE_CALENDAR == 9,
                "CONV_ROW_OUTSIDE_KIND_SQL writes these outside kinds");
+
+/* Whether stored row @p m's content holds frame @p name's opening line as
+ * llm_third_party_frame writes it ("--- NAME ---" or "--- NAME (dawn-ctx-...",
+ * at the start of a line), the line llm_third_party_present finds.  The
+ * neutralizer defuses an imitation in the text itself, so one found is
+ * DAWN's own.
+ *
+ * Deliberately looser than llm_third_party_present, which also wants the
+ * tag's 8 hex digits and its closing ")" and " ---" ending the line: a
+ * near-miss line ("--- NAME ----") is tainted here and clean live, so the
+ * stored rule errs toward taint.
+ *
+ * The v113 migration's backfill uses this too: a change here also changes
+ * what an install upgrading from before v113 marks, so check
+ * auth_db_migrations_v113.c when editing it. */
+/* clang-format off */
+#define CONV_FRAME_OPEN_SQL(name) "'--- " name " ---'"
+#define CONV_FRAME_OPEN_TAGGED_SQL(name) "'--- " name " (dawn-ctx-'"
+#define CONV_FRAMED_SQL(m, name) \
+   "(substr(" m ".content, 1, length(" CONV_FRAME_OPEN_SQL(name) ")) = " \
+   CONV_FRAME_OPEN_SQL(name) " OR substr(" m ".content, 1, length(" \
+   CONV_FRAME_OPEN_TAGGED_SQL(name) ")) = " CONV_FRAME_OPEN_TAGGED_SQL(name) " " \
+   "OR instr(" m ".content, char(10) || " CONV_FRAME_OPEN_SQL(name) ") > 0 " \
+   "OR instr(" m ".content, char(10) || " CONV_FRAME_OPEN_TAGGED_SQL(name) ") > 0)"
+
+/* The outside kind of stored tool result @p m that DAWN framed as someone
+ * else's text, NULL when it isn't one: the live scan's rule
+ * (memory_extraction_input.c, result_outside), the frames of TOOL_FRAMES_ALL
+ * in their order with llm_third_party_outside_kind's kinds.  An unframed
+ * result is judged by its call, which only the live scan reads.  The frame
+ * names come from tools/tool_registry.h, included where this is used.  A row
+ * with no line starting "--- " is no frame's, so it costs one scan; the frames
+ * are then tried in order, the first found winning, as the live scan does. */
+#define CONV_TOOL_FRAME_KIND_SQL(m) \
+   "(CASE WHEN " m ".role != 'tool' OR " m ".kind IS NOT NULL THEN NULL " \
+   "WHEN NOT (substr(" m ".content, 1, 4) = '--- ' OR " \
+   "instr(" m ".content, char(10) || '--- ') > 0) THEN NULL " \
+   "WHEN " CONV_FRAMED_SQL(m, TOOL_FRAME_EMAIL) " THEN 2 " \
+   "WHEN " CONV_FRAMED_SQL(m, TOOL_FRAME_WEB) " THEN 1 " \
+   "WHEN " CONV_FRAMED_SQL(m, TOOL_FRAME_DOCUMENT) " THEN 5 " \
+   "WHEN " CONV_FRAMED_SQL(m, TOOL_FRAME_CALENDAR) " THEN 9 " \
+   "WHEN " CONV_FRAMED_SQL(m, TOOL_FRAME_AGENT) " THEN 6 END)"
+/* clang-format on */
+_Static_assert(OUTSIDE_WEB == 1 && OUTSIDE_EMAIL == 2 && OUTSIDE_DOCUMENT == 5 &&
+                   OUTSIDE_MCP == 6 && OUTSIDE_CALENDAR == 9,
+               "CONV_TOOL_FRAME_KIND_SQL writes these outside kinds");
 
 /* The SET clause marking a conversations row extracted up to now (what was
  * learned so far: forgetting, delete-all), and extracting it again from the
@@ -1011,6 +1081,10 @@ _Static_assert(OUTSIDE_RESEARCH == 3 && OUTSIDE_DOCUMENT == 5 && OUTSIDE_OTHER =
  * In the table and added on its own (guarded) for a database already at v113. */
 #define MEMORY_CONSOLIDATION_OPS_SOURCE_COL \
    "source_conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE"
+
+/* Another: who wrote an op's reason, 'model' or 'dawn' (NULL: no reason, or a
+ * row recorded before it was kept).  A client shows the model's as its words. */
+#define MEMORY_CONSOLIDATION_OPS_REASON_BY_COL "reason_by TEXT"
 
 /* Indexes added to the v113 tables after v113 shipped: the record's ops by
  * relation (a relation forgotten removes its ops) and its batches by age (the
@@ -1074,7 +1148,8 @@ _Static_assert(OUTSIDE_RESEARCH == 3 && OUTSIDE_DOCUMENT == 5 && OUTSIDE_OTHER =
    "   status TEXT NOT NULL DEFAULT 'applied',"                                             \
    "   created_at INTEGER NOT NULL,"                                                        \
    "   undone_at INTEGER,"                                                                  \
-   "   " MEMORY_CONSOLIDATION_OPS_SOURCE_COL ");"                                           \
+   "   " MEMORY_CONSOLIDATION_OPS_SOURCE_COL ","                                            \
+   "   " MEMORY_CONSOLIDATION_OPS_REASON_BY_COL ");"                                        \
    "CREATE INDEX IF NOT EXISTS idx_mco_batch ON memory_consolidation_ops(batch_id, seq);"   \
    "CREATE INDEX IF NOT EXISTS idx_mco_fact ON memory_consolidation_ops(user_id, fact_id) " \
    "WHERE fact_id IS NOT NULL;"                                                             \
@@ -1308,6 +1383,22 @@ int auth_db_migrations_v112(sqlite3 *db);
 /** v113: a fact's origin and every memory row's outside kind (backfilled), and
  *  the consolidation record tables. */
 int auth_db_migrations_v113(sqlite3 *db);
+
+/** v114: documents.outside, a note's outside kind (backfilled). */
+int auth_db_migrations_v114(sqlite3 *db);
+
+/** Whether any of v114's columns is missing (documents.outside, documents.own,
+ *  document_versions.outside), whatever the stored version says. */
+bool auth_db_migrations_v114_pending(sqlite3 *db);
+/** v115: message_unprompted.replayed (posts stored before it keep replaying). */
+int auth_db_migrations_v115(sqlite3 *db);
+
+/** v116: the reasoning floor of conversations whose replay dropped signed
+ *  reasoning raised to their newest row; memory_extract_ranges. */
+int auth_db_migrations_v116(sqlite3 *db);
+
+/** v117: message_stopped, replies the user stopped before they finished. */
+int auth_db_migrations_v117(sqlite3 *db);
 
 /**
  * @brief The v98 rebuild's room check: the bytes it needs free next to the

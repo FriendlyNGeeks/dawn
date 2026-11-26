@@ -62,10 +62,20 @@
       transform 0.15s ease;
 }
 
+/* Closed, the panel's contents are skipped: its controls can't take focus or
+ * a Tab stop.  `content-visibility` and not `visibility`, which is inherited:
+ * a child with `transition: all` would animate it and still be hidden when
+ * the panel opens and focuses it.  Delayed to the end of the close transition
+ * so that still plays. */
 #doc-library-popover.hidden {
    opacity: 0;
    transform: translateY(-8px);
    pointer-events: none;
+   content-visibility: hidden;
+   transition:
+      opacity 0.15s ease,
+      transform 0.15s ease,
+      content-visibility 0s linear 0.15s allow-discrete;
 }
 
 /* =============================================================================
@@ -305,6 +315,29 @@
    margin-top: 2px;
 }
 
+/* "My own text": the shared .dawn-toggle switch, under the meta line. */
+.doc-library-item-own {
+   padding: 0;
+   margin-top: 4px;
+   width: fit-content;
+   cursor: pointer;
+}
+
+.doc-library-item-own .dawn-toggle-label {
+   font-size: 0.7rem;
+}
+
+.doc-library-own-hint {
+   margin: 0;
+   padding: 0 1rem 0.5rem;
+   font-size: 0.7rem;
+   color: var(--text-secondary);
+}
+
+.doc-library-own-hint.hidden {
+   display: none;
+}
+
 .doc-library-item-meta .global-badge {
    background: var(--accent);
    color: #fff;
@@ -492,6 +525,10 @@
    .doc-library-item-edit {
       opacity: 1;
       padding: 10px;
+   }
+
+   .doc-library-item-own {
+      min-height: 44px;
    }
 
    .note-detail-pane .form-actions .btn-primary,

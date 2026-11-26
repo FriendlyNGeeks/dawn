@@ -45,6 +45,7 @@
 #define ADMIN_SOCKET_INTERNAL_ALLOWED
 
 #include "audio/music_db.h"
+#include "audio/music_queue_db.h"
 #include "audio/music_scanner.h"
 #include "auth/admin_socket_internal.h"
 #include "auth/auth_crypto.h"
@@ -1047,6 +1048,8 @@ static int handle_delete_user(int client_fd, const char *payload, uint16_t paylo
    conv_db_withdraw_intent_end();
    if (rc == AUTH_DB_SUCCESS && removed_id > 0) {
       session_withdraw_forgotten_async(removed_id, false);
+      /* Its saved music queue is in its own file, so nothing cascades to it */
+      (void)music_queue_db_delete_user(removed_id);
    }
 
    if (rc == AUTH_DB_LAST_ADMIN) {
@@ -1176,11 +1179,14 @@ typedef struct {
    bool truncated;
 } session_list_ctx_t;
 
+_Static_assert(ADMIN_SESSION_PREFIX_LEN == AUTH_TOKEN_PREFIX_LEN,
+               "the admin wire prefix must be the length the session store matches on");
+
 static int session_list_callback(const auth_session_summary_t *session, void *ctx) {
    session_list_ctx_t *lctx = (session_list_ctx_t *)ctx;
 
    /* Each session entry is packed as:
-    * 8 bytes: token_prefix (null padded)
+    * ADMIN_SESSION_PREFIX_LEN bytes: token_prefix (null padded)
     * 1 byte: username_len
     * 8 bytes: created_at
     * 8 bytes: last_activity
@@ -1190,7 +1196,7 @@ static int session_list_callback(const auth_session_summary_t *session, void *ct
     */
    size_t uname_len = strlen(session->username);
    size_t ip_len = strlen(session->ip_address);
-   size_t entry_size = 8 + 1 + 8 + 8 + 1 + uname_len + ip_len;
+   size_t entry_size = ADMIN_SESSION_PREFIX_LEN + 1 + 8 + 8 + 1 + uname_len + ip_len;
 
    if (lctx->offset + entry_size > lctx->buffer_size) {
       lctx->truncated = true;
@@ -1199,10 +1205,10 @@ static int session_list_callback(const auth_session_summary_t *session, void *ct
 
    char *p = lctx->buffer + lctx->offset;
 
-   /* Pack token_prefix (8 bytes, null padded) */
-   memset(p, 0, 8);
-   memcpy(p, session->token_prefix, 8);
-   p += 8;
+   /* Pack token_prefix (null padded) */
+   memset(p, 0, ADMIN_SESSION_PREFIX_LEN);
+   memcpy(p, session->token_prefix, strnlen(session->token_prefix, ADMIN_SESSION_PREFIX_LEN));
+   p += ADMIN_SESSION_PREFIX_LEN;
 
    /* Pack username_len */
    *p++ = (uint8_t)uname_len;
@@ -1258,7 +1264,7 @@ static int handle_list_sessions(int client_fd) {
  *
  * Wire format:
  *   admin_auth_prefix_t (admin credentials)
- *   uint8_t token_prefix_len (should be 8)
+ *   uint8_t token_prefix_len (must be ADMIN_SESSION_PREFIX_LEN)
  *   char token_prefix[token_prefix_len]
  */
 static int handle_revoke_session(int client_fd, const char *payload, uint16_t payload_len) {
@@ -1279,17 +1285,19 @@ static int handle_revoke_session(int client_fd, const char *payload, uint16_t pa
    }
 
    uint8_t prefix_len = (uint8_t)remaining[0];
-   if (prefix_len < 8 || remaining_len < 1 + prefix_len) {
+   if (prefix_len != ADMIN_SESSION_PREFIX_LEN || remaining_len < 1 + prefix_len) {
       return send_response(client_fd, ADMIN_RESP_FAILURE);
    }
 
-   char prefix[9] = { 0 };
-   memcpy(prefix, remaining + 1, 8);
+   char prefix[ADMIN_SESSION_PREFIX_LEN + 1] = { 0 };
+   memcpy(prefix, remaining + 1, ADMIN_SESSION_PREFIX_LEN);
 
    /* Delete session by prefix */
    int rc = auth_db_delete_session_by_prefix(prefix);
    if (rc == AUTH_DB_NOT_FOUND) {
       return send_response(client_fd, ADMIN_RESP_NOT_FOUND);
+   } else if (rc == AUTH_DB_DUPLICATE) {
+      return send_response(client_fd, ADMIN_RESP_AMBIGUOUS);
    } else if (rc != AUTH_DB_SUCCESS) {
       return send_response(client_fd, ADMIN_RESP_SERVICE_ERROR);
    }
@@ -2260,6 +2268,9 @@ static int handle_client(int client_fd) {
 
       case ADMIN_MSG_MEMORY_REEXTRACT_STATUS:
          return handle_memory_reextract_status(client_fd, payload, header.payload_len);
+
+      case ADMIN_MSG_MEMORY_EXTRACT_RANGE:
+         return handle_memory_extract_range(client_fd, payload, header.payload_len);
 
       /* Phase 6.5: Entity-merge alias surface (v43) */
       case ADMIN_MSG_MEMORY_ENTITY_MERGE:

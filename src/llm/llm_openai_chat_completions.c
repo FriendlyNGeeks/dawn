@@ -131,6 +131,12 @@ static size_t streaming_write_callback(void *contents, size_t size, size_t nmemb
    size_t realsize = size * nmemb;
    openai_streaming_context_t *ctx = (openai_streaming_context_t *)userp;
 
+   /* Stopped: take no more of what curl already holds (a short write ends the
+    * transfer).  Each event fed on would run its sentence through speech. */
+   if (llm_transfer_cancelled()) {
+      return 0;
+   }
+
    /* Capture raw response for error diagnostics (cap at OPENAI_RAW_BUFFER_CAP).
     * Matches Claude's streaming context pattern (see llm_claude.c). */
    if (ctx->raw_response.size < OPENAI_RAW_BUFFER_CAP) {
@@ -251,6 +257,33 @@ static void add_cloud_reasoning_effort(json_object *root,
    OLOG_INFO("Cloud LLM: Reasoning effort set to '%s' for model %s%s", effort, model_name, note);
 }
 
+/* The reply ceiling, once the tools are attached: by effort when streamed and
+ * reasoning (reasoning counts toward OpenAI's max_completion_tokens and
+ * Gemini's output limit; llm_reply_max_tokens), held to the room the window
+ * leaves, the tools included (the history alone is sent).  A local server
+ * takes [llm] max_tokens as it is: it stops at its window rather than reject
+ * the request, and its window may still be the default before it answers. */
+static void add_max_tokens(json_object *root,
+                           json_object *history,
+                           const char *base_url,
+                           const char *api_key,
+                           const char *model_name,
+                           bool streamed) {
+   if (api_key == NULL) {
+      json_object_object_add(root, "max_tokens", json_object_new_int(g_config.llm.max_tokens));
+      return;
+   }
+   const cloud_provider_t provider = provider_for_endpoint(base_url);
+   llm_thinking_resolved_t thinking;
+   llm_thinking_resolve_current(LLM_CLOUD, provider, model_name, &thinking);
+   int max_tokens = llm_reply_max_tokens(LLM_CLOUD, provider, model_name, &thinking, streamed);
+   json_object *tools = NULL;
+   json_object_object_get_ex(root, "tools", &tools);
+   max_tokens = llm_context_fit_reply(max_tokens, history, NULL, tools, LLM_CLOUD, provider,
+                                      model_name);
+   json_object_object_add(root, "max_completion_tokens", json_object_new_int(max_tokens));
+}
+
 /* ── Non-streaming chat completion ──────────────────────────────────────── */
 
 char *llm_openai_cc_chat_completion(struct json_object *conversation_history,
@@ -311,13 +344,6 @@ char *llm_openai_cc_chat_completion(struct json_object *conversation_history,
    json_object_object_add(root, "messages", converted_history);
    add_prompt_cache_key(root, api_key, base_url);
 
-   if (api_key == NULL) {
-      json_object_object_add(root, "max_tokens", json_object_new_int(g_config.llm.max_tokens));
-   } else {
-      json_object_object_add(root, "max_completion_tokens",
-                             json_object_new_int(g_config.llm.max_tokens));
-   }
-
    if (llm_tools_enabled(NULL)) {
       /* The conversation's own tool set when it has one (llm_history_kind.h). */
       const char *source = NULL;
@@ -335,6 +361,8 @@ char *llm_openai_cc_chat_completion(struct json_object *conversation_history,
                    source);
       }
    }
+
+   add_max_tokens(root, conversation_history, base_url, api_key, model_name, false);
 
    /* One leading system message: strict local chat templates (Qwen 3.5/3.6
     * Jinja) reject a second. */
@@ -624,13 +652,6 @@ int llm_openai_cc_streaming_single_shot(struct json_object *conversation_history
    json_object_object_add(root, "messages", converted_history);
    add_prompt_cache_key(root, api_key, base_url);
 
-   if (api_key == NULL) {
-      json_object_object_add(root, "max_tokens", json_object_new_int(g_config.llm.max_tokens));
-   } else {
-      json_object_object_add(root, "max_completion_tokens",
-                             json_object_new_int(g_config.llm.max_tokens));
-   }
-
    /* The loop's last call (iteration at the cap), for a text answer: the tools
     * stay (the request reads as every other did), none may be called. */
    if (llm_tools_enabled(NULL)) {
@@ -649,6 +670,8 @@ int llm_openai_cc_streaming_single_shot(struct json_object *conversation_history
       }
    }
 
+   add_max_tokens(root, conversation_history, base_url, api_key, model_name, true);
+
    /* One leading system message: strict local chat templates (Qwen 3.5/3.6
     * Jinja) reject a second. */
    llm_openai_merge_leading_system_messages(root);
@@ -661,7 +684,7 @@ int llm_openai_cc_streaming_single_shot(struct json_object *conversation_history
              (model_name && model_name[0]) ? model_name : "(server default)");
 
    if (!llm_check_connection(base_url, 4)) {
-      llm_set_last_error(LLM_ERR_TRANSIENT_NETWORK);
+      llm_set_last_error(LLM_ERR_UNREACHABLE);
       OLOG_ERROR("Pre-flight connection check failed (cloud unreachable)");
       json_object_put(root);
       return 1;
@@ -689,7 +712,7 @@ int llm_openai_cc_streaming_single_shot(struct json_object *conversation_history
    streaming_ctx.stream_ctx = stream_ctx;
    curl_buffer_init_with_max(&streaming_ctx.raw_response, OPENAI_RAW_BUFFER_CAP);
 
-   int max_attempts = 2;
+   int max_attempts = llm_provider_errors_quiet() ? 1 : 2;
    for (int attempt = 0; attempt < max_attempts; attempt++) {
       curl_handle = curl_easy_init();
       if (!curl_handle) {
@@ -713,7 +736,9 @@ int llm_openai_cc_streaming_single_shot(struct json_object *conversation_history
       curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 0L);
       curl_easy_setopt(curl_handle, CURLOPT_XFERINFOFUNCTION, llm_curl_progress_callback);
       curl_easy_setopt(curl_handle, CURLOPT_XFERINFODATA, NULL);
-      curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT_MS, LLM_CONNECT_TIMEOUT_MS);
+      curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT_MS,
+                       llm_provider_errors_quiet() ? LLM_FALLBACK_CONNECT_TIMEOUT_MS
+                                                   : LLM_CONNECT_TIMEOUT_MS);
       {
          int eff_to = llm_get_effective_timeout_ms();
          long lspt = 60L;
@@ -751,13 +776,20 @@ int llm_openai_cc_streaming_single_shot(struct json_object *conversation_history
             continue;
          }
 
-         if (res == CURLE_ABORTED_BY_CALLBACK) {
+         /* The write callback ends a stopped transfer with a short write. */
+         const bool stopped = res == CURLE_ABORTED_BY_CALLBACK ||
+                              (res == CURLE_WRITE_ERROR && llm_transfer_cancelled());
+         if (stopped) {
             OLOG_INFO("LLM transfer interrupted by user");
+            /* What had streamed; no blocks: which reasoning finished can't be told. */
+            llm_stream_fill_stopped(stream_ctx, result);
          } else {
             OLOG_ERROR("curl_easy_perform() failed: %s", curl_easy_strerror(res));
          }
+         llm_note_curl_failure(curl_handle, res);
 #ifdef ENABLE_WEBUI
-         if (res != CURLE_ABORTED_BY_CALLBACK) {
+         if (!stopped &&
+             !(llm_provider_errors_quiet() && llm_error_is_transient(llm_last_error()))) {
             session_t *session = session_get_command_context();
             if (session && session->type == SESSION_TYPE_WEBUI) {
                const char *error_code = (res == CURLE_OPERATION_TIMEDOUT) ? "LLM_TIMEOUT"
@@ -803,7 +835,8 @@ int llm_openai_cc_streaming_single_shot(struct json_object *conversation_history
       }
 #ifdef ENABLE_WEBUI
       session_t *session = session_get_command_context();
-      if (session && session->type == SESSION_TYPE_WEBUI) {
+      if (session && session->type == SESSION_TYPE_WEBUI &&
+          !(llm_provider_errors_quiet() && llm_error_is_transient(llm_last_error()))) {
          const char *err_msg = llm_openai_parse_error_message(streaming_ctx.raw_response.data,
                                                               http_code);
          webui_send_error(session, "LLM_ERROR", err_msg);

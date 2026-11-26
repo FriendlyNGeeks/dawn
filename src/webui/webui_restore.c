@@ -32,6 +32,7 @@
 #include "llm/llm_command_parser.h"
 #include "llm/llm_history_kind.h"
 #include "llm/llm_interface.h"
+#include "llm/llm_selection.h"
 #include "llm/llm_turn_blocks.h"
 #include "logging.h"
 #include "memory/memory_history_loader.h"
@@ -61,69 +62,18 @@ static json_object *webui_build_conversation_context(int user_id,
                                          conv->compaction_summary, NULL, count_out);
 }
 
-/* A conversation's stored LLM settings (its last-used model/provider/thinking)
- * applied over @p base into @p out.  false when it stores none. */
-static bool conversation_llm_config(const conversation_t *conv,
-                                    const session_llm_config_t *base,
-                                    session_llm_config_t *out) {
-   /* tools_mode is a retired dead column — no longer hydrated. */
-   if (conv->llm_type[0] == '\0') {
-      return false;
-   }
-   session_llm_config_t cfg = *base;
-
-   if (strcmp(conv->llm_type, "local") == 0)
-      cfg.type = LLM_LOCAL;
-   else if (strcmp(conv->llm_type, "cloud") == 0)
-      cfg.type = LLM_CLOUD;
-   if (conv->cloud_provider[0] != '\0') {
-      if (strcmp(conv->cloud_provider, "openai") == 0)
-         cfg.cloud_provider = CLOUD_PROVIDER_OPENAI;
-      else if (strcmp(conv->cloud_provider, "claude") == 0)
-         cfg.cloud_provider = CLOUD_PROVIDER_CLAUDE;
-      else if (strcmp(conv->cloud_provider, "gemini") == 0)
-         cfg.cloud_provider = CLOUD_PROVIDER_GEMINI;
-      else if (strcmp(conv->cloud_provider, "openrouter") == 0)
-         cfg.cloud_provider = CLOUD_PROVIDER_OPENROUTER;
-   }
-   if (conv->model[0] != '\0') {
-      safe_strscpy(cfg.model, conv->model);
-
-      /* Infer provider from model name if not explicitly stored. OpenRouter IDs are
-       * "vendor/model" slugs and match none of the bare prefixes below, so an
-       * OpenRouter conversation's provider/model are left as stored. */
-      if (conv->cloud_provider[0] == '\0') {
-         if (strncmp(conv->model, "gpt-", 4) == 0 || strncmp(conv->model, "o1-", 3) == 0 ||
-             strncmp(conv->model, "o3-", 3) == 0) {
-            cfg.cloud_provider = CLOUD_PROVIDER_OPENAI;
-         } else if (strncmp(conv->model, "claude-", 7) == 0) {
-            cfg.cloud_provider = CLOUD_PROVIDER_CLAUDE;
-         } else if (strncmp(conv->model, "gemini-", 7) == 0) {
-            cfg.cloud_provider = CLOUD_PROVIDER_GEMINI;
-         }
-      }
-   }
-
-   /* The conversation's reasoning: its mode and its effort, both. */
-   if (conv->thinking_mode[0] != '\0') {
-      safe_strscpy(cfg.thinking_mode, conv->thinking_mode);
-   }
-   if (conv->reasoning_effort[0] != '\0') {
-      safe_strscpy(cfg.reasoning_effort, conv->reasoning_effort);
-   }
-   *out = cfg;
-   return true;
+/* A conversation's stored LLM settings (llm_selection_from_row: none of its own
+ * follows the default). */
+static void conversation_llm_config(const conversation_t *conv, session_llm_config_t *out) {
+   llm_selection_from_row(conv->llm_type, conv->cloud_provider, conv->model, conv->thinking_mode,
+                          conv->reasoning_effort, out);
 }
 
-/* Apply a conversation's stored LLM settings to the session (no-op when it
- * stores none). */
+/* Apply a conversation's stored LLM settings to the session. */
 static void webui_apply_conversation_llm_config(session_t *session, const conversation_t *conv) {
-   session_llm_config_t base;
    session_llm_config_t cfg;
-   session_get_llm_config(session, &base);
-   if (conversation_llm_config(conv, &base, &cfg)) {
-      session_set_llm_config(session, &cfg);
-   }
+   conversation_llm_config(conv, &cfg);
+   session_set_llm_config(session, &cfg);
 }
 
 /**
@@ -143,12 +93,19 @@ static int webui_restore_session_context(session_t *session,
    if (count_out) {
       *count_out = 0;
    }
+   /* The point the history is built at: read first, and only when @p conv
+    * (read by the caller before it) still has its compaction, whose summary
+    * the build uses. */
+   conv_sync_point_t at;
+   const bool at_ok = conv_db_sync_point_get(conv_id, user_id, &at) == AUTH_DB_SUCCESS &&
+                      at.watermark == conv->context_watermark_msg_id;
    int count = 0;
    json_object *hist = webui_build_conversation_context(user_id, conv, conv_id, &count);
    if (!hist) {
       return FAILURE;
    }
-   session_replace_history(session, hist, conv_id); /* a new context: its dedup state too */
+   /* A new context (its dedup state too), and the point it was built at. */
+   session_replace_history_at(session, hist, conv_id, user_id, at_ok ? &at : NULL);
    webui_apply_conversation_llm_config(session, conv);
    if (count_out) {
       *count_out = count;
@@ -170,10 +127,7 @@ int webui_restore_conversation_context(ws_connection_t *conn,
  * the conversation being viewed. */
 json_object *webui_turn_history_loader(int user_id,
                                        int64_t conv_id,
-                                       const session_llm_config_t *base,
-                                       session_llm_config_t *cfg_out,
-                                       bool *has_cfg_out) {
-   *has_cfg_out = false;
+                                       session_llm_config_t *cfg_out) {
    conversation_t conv;
    memset(&conv, 0, sizeof(conv));
    if (conv_db_get(conv_id, user_id, &conv) != AUTH_DB_SUCCESS) {
@@ -183,7 +137,7 @@ json_object *webui_turn_history_loader(int user_id,
    int count = 0;
    json_object *hist = webui_build_conversation_context(user_id, &conv, conv_id, &count);
    if (hist) {
-      *has_cfg_out = conversation_llm_config(&conv, base, cfg_out);
+      conversation_llm_config(&conv, cfg_out);
    }
    conv_free(&conv);
    return hist;

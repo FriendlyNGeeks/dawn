@@ -36,17 +36,13 @@
 
 #include "auth/auth_db.h"
 #include "auth/auth_db_messages.h"
-#include "core/job_dispatch.h" /* job_provider_from_default */
+#include "core/job_dispatch.h" /* job_selection_load, job_provider_for */
 #include "core/job_manager.h"
+#include "core/job_report.h"
 #include "core/session_manager.h"
 #include "logging.h"
+#include "tools/document_db.h" /* the report's title */
 #include "tools/research_run.h"
-
-/* Defined in webui_broadcasts.c (webui_absent.c without the WebUI).  Declared here rather than
- * pulling in the heavy webui_server.h — the job_worker.c → webui_server.h include is tracked debt
- * we don't want to grow. Signals an open WebUI chat that a conversation has new messages →
- * refetch+render. */
-void webui_broadcast_conversation_messages_appended(int user_id, int64_t conv_id);
 
 /* Work item handed to the detached worker thread. */
 typedef struct {
@@ -89,52 +85,43 @@ static void research_deliver_to_parent(int64_t job_conv, int user_id, const char
    }
    int claim_count = 0;
    research_db_claim_count(run.id, &claim_count);
-   bool have_summary = (summary != NULL && summary[0] != '\0');
-
-   char msg[RESEARCH_BRIEF_MAX + 1024];
-   if (claim_count > 0 && run.report_doc_id > 0 && have_summary) {
-      /* The useful case: lead with the synthesized answer, then point to the note. */
-      snprintf(msg, sizeof(msg),
-               "🔍 Deep research complete — \"%s\".\n\n%s\n\nThat's the gist — I gathered %d "
-               "finding%s; the full cited report is in your notes.",
-               run.brief, summary, claim_count, claim_count == 1 ? "" : "s");
-   } else if (claim_count > 0 && run.report_doc_id > 0) {
-      snprintf(msg, sizeof(msg),
-               "🔍 Deep research complete — \"%s\".\n\nI gathered %d finding%s and saved a cited "
-               "report to your notes. Ask me about it, or open it in your documents.",
-               run.brief, claim_count, claim_count == 1 ? "" : "s");
-   } else if (claim_count > 0) {
-      /* Findings gathered, but the note/document save failed (report_doc_id stayed
-       * 0) — don't claim a report is in notes when it isn't.  The evidence is still
-       * in the ledger, so offer to summarize rather than point at a missing doc. */
-      snprintf(msg, sizeof(msg),
-               "🔍 Deep research complete — \"%s\".\n\nI gathered %d finding%s, but couldn't save "
-               "the report to your notes. Ask me and I'll summarize what I found.",
-               run.brief, claim_count, claim_count == 1 ? "" : "s");
-   } else {
-      snprintf(msg, sizeof(msg),
-               "🔍 Deep research on \"%s\" finished, but I couldn't find enough to report. Try "
-               "rephrasing or narrowing the question.",
-               run.brief);
+   /* Named as the user would look for it: the report's title in their notes,
+    * else the job's.  The brief is the research agent's instructions. */
+   const char *label = rec.title[0] != '\0' ? rec.title : run.brief;
+   document_t report;
+   if (run.report_doc_id > 0 && document_db_get(run.report_doc_id, &report) == SUCCESS &&
+       report.filename[0] != '\0') {
+      label = report.filename;
    }
-
-   int64_t msg_id = 0;
-   /* no-blocks: DAWN's own completion note, not a model turn; unprompted, so memory
-    * extraction leaves it out. */
-   const conv_message_row_t row = { .role = "assistant", .content = msg, .unprompted = true };
-   if (conv_db_add_row(rec.parent_id, user_id, &row, &msg_id) != AUTH_DB_SUCCESS) {
-      OLOG_WARNING("research_worker: failed to post completion to parent conv %lld",
-                   (long long)rec.parent_id);
+   char *msg = research_completion_message(label, summary, claim_count, run.report_doc_id > 0);
+   if (!msg) {
+      OLOG_ERROR("research_worker: out of memory for conv %lld's completion message",
+                 (long long)job_conv);
       return;
    }
-   webui_broadcast_conversation_messages_appended(user_id, rec.parent_id);
-   OLOG_INFO("research_worker: posted completion to parent conv %lld (msg %lld)",
-             (long long)rec.parent_id, (long long)msg_id);
+
+   /* DAWN's own completion note, not a model turn: unprompted, so memory
+    * extraction leaves it out. */
+   if (job_report_post(rec.parent_id, user_id, msg) == SUCCESS) {
+      OLOG_INFO("research_worker: posted completion to parent conv %lld", (long long)rec.parent_id);
+   }
+   free(msg);
 }
 
 static void research_worker_run(research_work_t *work) {
    session_t *s = NULL;
-   int rc = job_manager_begin(work->user_id, work->conv_id, job_provider_from_default(), &s);
+   /* The LLM stored when the run was spawned. */
+   session_llm_config_t llm;
+   if (job_selection_load(work->conv_id, work->user_id, &llm) != AUTH_DB_SUCCESS) {
+      time_t now = time(NULL);
+      research_mark_run_terminal(work->conv_id, "failed", "failed", now);
+      job_manager_set_terminal(work->conv_id, work->user_id, "failed",
+                               "couldn't read the run's model", now, 0);
+      job_manager_mark_dirty();
+      OLOG_WARNING("research_worker: could not read conv %lld's model", (long long)work->conv_id);
+      return;
+   }
+   int rc = job_manager_begin(work->user_id, work->conv_id, job_provider_for(&llm), &s);
    if (rc != JOB_MGR_OK) {
       /* The tool checks caps before creating the row, but guard the race. */
       const char *err = (rc == JOB_MGR_CAP_GLOBAL || rc == JOB_MGR_CAP_PROVIDER ||
@@ -165,6 +152,7 @@ static void research_worker_run(research_work_t *work) {
       job_manager_end(s);
       return;
    }
+   session_set_llm_config(s, &llm);
    /* queued -> running is a state change WITHIN the active set (no count change),
     * but without it a watcher's row reads 'queued' with started_at 0 for the whole
     * runtime and an elapsed timer renders 1970.  Single-owner from here on. */

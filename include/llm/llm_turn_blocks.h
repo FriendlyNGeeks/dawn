@@ -182,6 +182,36 @@ struct json_object *llm_turn_blocks_with_final_text(struct json_object *blocks,
                                                     const char *final_text);
 
 /**
+ * @brief A stopped reply's blocks: as llm_turn_blocks_with_final_text(), with
+ *        nothing after its text
+ *
+ * A stop can cut a turn after its text and a later block finished (reasoning
+ * before a tool call left out): a reply ending in reasoning is refused when
+ * replayed, so what follows the text goes.
+ *
+ * @return New blocks (caller owns them), or NULL
+ */
+struct json_object *llm_turn_blocks_stopped_reply(struct json_object *blocks,
+                                                  const char *partial_text);
+
+/** A cleanup applied to a block's text: the new text (caller of the hook frees
+ *  it), or NULL on failure. */
+typedef char *(*llm_turn_text_clean_fn)(const char *text, void *ctx);
+
+/**
+ * @brief Clean every text block of @p blocks in place, through @p clean
+ *
+ * Unlike llm_turn_blocks_with_final_text, each text block keeps its place among
+ * the reasoning and tool calls (Claude interleaves them).  A text block left
+ * empty is removed: Claude rejects an empty text block, and stored blocks are
+ * sent again on every later request.  Reasoning and tool calls are untouched.
+ *
+ * @return SUCCESS, or FAILURE when @p clean failed for a block: that block is
+ *         removed too (text that couldn't be cleaned is never kept)
+ */
+int llm_turn_blocks_clean_text(struct json_object *blocks, llm_turn_text_clean_fn clean, void *ctx);
+
+/**
  * @brief Render blocks as OpenAI Responses input items, appended to @p input
  *
  * Each run of text as one assistant message (output_text), tool calls as

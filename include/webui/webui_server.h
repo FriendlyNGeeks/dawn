@@ -393,6 +393,9 @@ void webui_send_compaction_complete(struct session *session,
  */
 void webui_send_stream_start(struct session *session);
 
+/** Bytes of text one stream frame carries, NUL included (ws_response_t.stream.text) */
+#define WEBUI_STREAM_TEXT_SIZE 1024
+
 /**
  * @brief Send incremental text chunk during LLM streaming
  *
@@ -408,27 +411,6 @@ void webui_send_stream_start(struct session *session);
 void webui_send_stream_delta(struct session *session, const char *text);
 
 /**
- * @brief Filter command tags from text and return filtered result
- *
- * Strips <command>...</command> tags from text using the session's filter state.
- * Used by callers that need the filtered text (e.g., TTS sentence buffer).
- * Uses the same state machine as webui_send_stream_delta for consistency.
- *
- * @param session Session with filter state
- * @param text Input text to filter
- * @param out_buf Output buffer for filtered text
- * @param out_size Size of output buffer
- * @return Length of filtered text written to out_buf
- *
- * @note Filter state persists across calls for partial tag handling
- * @note If native tools are enabled, returns input unchanged
- */
-int webui_filter_command_tags(struct session *session,
-                              const char *text,
-                              char *out_buf,
-                              size_t out_size);
-
-/**
  * @brief End the current LLM token stream
  *
  * Signals the client to finalize the current assistant entry.
@@ -440,6 +422,21 @@ int webui_filter_command_tags(struct session *session,
  * @note Sets session->llm_streaming_active = false
  */
 void webui_send_stream_end(struct session *session, const char *reason);
+
+/**
+ * @brief The end of one model message's text in a turn's stream (before its tool
+ *        calls; the turn's last message ends at webui_send_stream_end).
+ *
+ * A memory-citation tag counts only at the end of a message's text, so the
+ * stream's <cited> filter is resolved here: a trailing tag is dropped, held bytes
+ * that are text go out.  Called by the tool loop at every tool boundary, whether
+ * or not the turn installed a tool-iteration hook (a satellite's turn has none).
+ * No-op for a session that doesn't stream (a weak default in llm_tool_loop.c for
+ * a build without the WebUI).
+ *
+ * @param session The turn's session
+ */
+void webui_stream_message_end(struct session *session);
 
 /**
  * @brief Tool-iteration-boundary hook — seals the open streaming bubble so the next

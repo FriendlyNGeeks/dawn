@@ -33,6 +33,8 @@
  * webui_internal.h.
  */
 
+#include "webui/webui_send.h"
+
 #include <json-c/json.h>
 #include <libwebsockets.h>
 #include <pthread.h>
@@ -553,6 +555,8 @@ void send_error_frame(struct lws *wsi,
    if (client_ref && client_ref[0]) {
       json_object_object_add(payload, "client_ref", json_object_new_string(client_ref));
    }
+   /* Raised while handling a request of this connection's: say which. */
+   webui_protocol_request_stamp(wsi, payload, true);
    json_object_object_add(obj, "type", json_object_new_string("error"));
    json_object_object_add(obj, "payload", payload);
 
@@ -1182,5 +1186,16 @@ void process_response_queue(void) {
    process_one_response();
 }
 
+
+void webui_send_turn_refusal(session_t *session,
+                             const char *reason,
+                             session_sentence_callback speak,
+                             bool use_opus) {
+   webui_send_error(session, "LLM_NOT_SELECTED", reason);
+   if (speak) {
+      speak(reason, session);
+      webui_send_audio_end(session, use_opus);
+   }
+}
 
 /* HTTP auth handlers and protocol callback moved to webui_http.c */

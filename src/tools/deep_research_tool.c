@@ -51,6 +51,7 @@
 #include "core/session_manager.h"
 #include "core/turn_origin.h"
 #include "dawn_error.h"
+#include "llm/llm_selection.h"
 #include "logging.h"
 #include "tools/research_run.h"
 #include "tools/tool_pending.h"
@@ -60,6 +61,17 @@
 /* Cap on ledger questions we tally for the status digest (matches the core's
  * per-pass ceiling). */
 #define DR_STATUS_MAX_QUESTIONS RESEARCH_MAX_LEDGER_QUESTIONS
+
+/* The brief length the tool description promises the model.  It is a round
+ * number of characters below the stored limit (RESEARCH_BRIEF_MAX bytes,
+ * including the NUL), so a brief written to it fits; start still refuses
+ * anything longer than the store holds, since non-ASCII text takes more bytes. */
+#define DR_BRIEF_DESCRIBED_MAX 2000
+_Static_assert(DR_BRIEF_DESCRIBED_MAX < RESEARCH_BRIEF_MAX,
+               "the described brief limit must fit in RESEARCH_BRIEF_MAX");
+#define DR_STR_(x) #x
+#define DR_STR(x) DR_STR_(x)
+#define DR_BRIEF_DESCRIBED_MAX_TEXT DR_STR(DR_BRIEF_DESCRIBED_MAX)
 
 /* --- start: propose (unconfirmed) or spawn (confirmed) --------------------- */
 
@@ -76,6 +88,11 @@
 #define DR_TOKEN_HEX_LEN 15 /* 7 random bytes -> 14 hex + NUL */
 #define DR_DELIVER_MAX 128
 #define DR_PENDING_PROPOSAL 1
+
+/* A refused brief names the phrase, so the model rewords that and nothing else. */
+#define RESEARCH_BRIEF_REFUSED_FMT                                                     \
+   "Error: that research brief contains \"%s\", which reads as an instruction to the " \
+   "model, so it was refused. Reword that phrase and try again."
 
 typedef struct {
    pending_slot_t hdr;
@@ -245,10 +262,12 @@ static int dr_pending_claim(const turn_origin_t *origin,
 static char *research_build_proposal(const char *brief, bool private_requested, const char *token) {
    research_budgets_t b;
    research_budgets_load(&b);
-   const bool local = (job_provider_from_default() == JOB_PROVIDER_LOCAL);
+   session_llm_config_t llm;
+   job_selection_of_spawner(&llm);
+   const bool local = (job_provider_for(&llm) == JOB_PROVIDER_LOCAL);
 
-   /* Sized to hold a full-length brief (RESEARCH_BRIEF_MAX) plus the fixed prose,
-    * so a long brief is never silently truncated. */
+   /* Sized to hold a full-length brief (RESEARCH_BRIEF_MAX) plus the fixed prose;
+    * start refuses a longer brief, so the brief and the token are never cut off. */
    char out[RESEARCH_BRIEF_MAX + 768];
    int n = snprintf(
        out, sizeof(out),
@@ -298,10 +317,14 @@ int research_spawn_run(int user_id,
       snprintf(err, err_len, "Error: 'brief' is required — the question or topic to research.");
       return FAILURE;
    }
-   /* Re-filter here so BOTH spawn surfaces gate the brief (§16.4); the tool also
-    * filters early, before its proposal, so a bad brief never gets a proposal. */
-   if (memory_filter_check(brief)) {
-      snprintf(err, err_len, "Error: that research brief was rejected by the safety filter.");
+   /* Checked here so both spawn surfaces gate the brief; the tool also checks
+    * before its proposal, so a refused brief never gets one.  Only phrases that
+    * read as a command to the model are refused: the full memory blocklist also
+    * refuses credential vocabulary ("password", "OAuth tokens"), which is the
+    * subject of ordinary security research. */
+   const char *blocked = memory_filter_injection_command_match(brief);
+   if (blocked != NULL) {
+      snprintf(err, err_len, RESEARCH_BRIEF_REFUSED_FMT, blocked);
       return FAILURE;
    }
 
@@ -318,8 +341,20 @@ int research_spawn_run(int user_id,
       return FAILURE;
    }
 
+   /* The run uses the LLM of the turn that started it, checked now. */
+   session_llm_config_t llm;
+   job_selection_of_spawner(&llm);
+   char refused[LLM_SELECTION_REASON_MAX];
+   if (llm_selection_problem(&llm, refused, sizeof(refused)) != 0) {
+      snprintf(err, err_len, "Can't start that research run. %s", refused);
+      return FAILURE;
+   }
+
+   conv_llm_columns_t llm_cols;
+   job_selection_columns(&llm, &llm_cols);
+
    /* Refuse cleanly past a running cap before creating any row. */
-   job_provider_class_t provider = job_provider_from_default();
+   job_provider_class_t provider = job_provider_for(&llm);
    int cap = job_manager_capacity(user_id, provider);
    if (cap != JOB_MGR_OK) {
       const char *why = (cap == JOB_MGR_CAP_GLOBAL) ? "the system is at its background-job limit"
@@ -340,7 +375,8 @@ int research_spawn_run(int user_id,
     * reinvoke_parent (§11 HIGH-2). */
    int64_t conv_id = 0;
    if (conv_db_create_job_ex(user_id, title, parent_conv, "detached", "notify", deliver_to, 1,
-                             brief, job_spawn_origin_string(), &conv_id) != AUTH_DB_SUCCESS) {
+                             brief, job_spawn_origin_string(), &llm_cols,
+                             &conv_id) != AUTH_DB_SUCCESS) {
       snprintf(err, err_len, "Error: failed to create the research job.");
       return FAILURE;
    }
@@ -351,7 +387,7 @@ int research_spawn_run(int user_id,
     * stamp must fail the start CLOSED: an unmarked research job is plain-resumable
     * and a plain resume would corrupt the run.  The run row doesn't exist yet, so
     * only the job row needs retiring. */
-   if (conv_db_job_set_kind(conv_id, "research") != AUTH_DB_SUCCESS) {
+   if (conv_db_job_set_kind(conv_id, JOB_KIND_RESEARCH) != AUTH_DB_SUCCESS) {
       job_manager_set_terminal(conv_id, user_id, "failed", "failed to mark research job",
                                time(NULL), 0);
       job_manager_mark_dirty();
@@ -473,9 +509,25 @@ static char *handle_start(struct json_object *details,
       return strdup(TOOL_RESULT_ERROR_MARK
                     "Error: 'brief' is required — the question or topic to research.");
    }
-   if (memory_filter_check(brief)) {
-      return strdup(TOOL_RESULT_ERROR_MARK
-                    "Error: that research brief was rejected by the safety filter.");
+   const char *blocked = memory_filter_injection_command_match(brief);
+   if (blocked != NULL) {
+      char refusal[256];
+      snprintf(refusal, sizeof(refusal), TOOL_RESULT_ERROR_MARK RESEARCH_BRIEF_REFUSED_FMT,
+               blocked);
+      return strdup(refusal);
+   }
+   /* Refuse before staging: the stored proposal and the proposal text both hold
+    * at most RESEARCH_BRIEF_MAX - 1 bytes, and a longer brief would be cut there
+    * (the proposal would lose its confirm token). */
+   const size_t brief_len = strlen(brief);
+   if (brief_len >= RESEARCH_BRIEF_MAX) {
+      char msg[256];
+      snprintf(msg, sizeof(msg),
+               TOOL_RESULT_ERROR_MARK
+               "Error: the research brief is too long (%zu bytes; the limit is %d). Shorten the "
+               "brief and call deep_research start again.",
+               brief_len, RESEARCH_BRIEF_MAX - 1);
+      return strdup(msg);
    }
 
    /* mode is validated but P0 supports web only (private/both need the P2 egress
@@ -645,9 +697,10 @@ static char *deep_research_callback(const char *action, char *value, int *should
    }
 
    /* Execution backstop for the runtime master switch: the native schema already
-    * hides the tool when disabled (llm_tools_refresh), but this refuses any
-    * non-schema entry (a legacy <command> tag, a hallucinated call replayed from
-    * history) so a disabled feature can never actually run. */
+    * hides the tool when disabled (llm_tools_refresh), but this refuses a call
+    * from outside the advertised schema (a model calling it because an earlier
+    * turn used it, or a caller that doesn't go through the schema) so a disabled
+    * feature can never actually run. */
    if (!g_config.research.enabled) {
       return strdup(TOOL_RESULT_ERROR_MARK
                     "Deep research is turned off. Enable it in Settings → Deep Research "
@@ -695,7 +748,7 @@ static char *deep_research_callback(const char *action, char *value, int *should
    /* A background-job/research worker runs headless and must never start research
     * runs (unbounded fan-out).  The tool is already hidden from a research
     * session's schema (allowlist) and from a job session's; this backstops any
-    * non-schema path (e.g. a legacy <command> tag). */
+    * path that doesn't go through the schema. */
    if (caller_is_job && starts_work) {
       json_object_put(details);
       return strdup(TOOL_RESULT_ERROR_MARK
@@ -759,11 +812,12 @@ static const treg_param_t deep_research_params[] = {
            "JSON object of the action's arguments, passed as a JSON-encoded string.  "
            "Omit entirely for an action that takes no arguments; never fill it with a "
            "description or rationale.\n"
-           "start: {brief (required — the question/topic to research), mode ('web' (default), "
-           "'private', or 'both'; private/both are not available yet and run web-only), deliver_to "
-           "(optional messaging channel display_name for the completion notice)}. start only "
-           "proposes: it returns the plan + cost envelope and a pending_token; show the plan to "
-           "the user.\n"
+           "start: {brief (required — the question/topic to research, up to "
+           "about " DR_BRIEF_DESCRIBED_MAX_TEXT
+           " characters), mode ('web' (default), 'private', or "
+           "'both'; private/both are not available yet and run web-only), deliver_to (optional "
+           "messaging channel display_name for the completion notice)}. start only proposes: it "
+           "returns the plan + cost envelope and a pending_token; show the plan to the user.\n"
            "confirm_start: {pending_token (required — the token start returned)}. Call it only "
            "after the user agrees, in their reply to the proposal; the run uses the exact brief "
            "proposed. The token is single-use and expires in 10 minutes.\n"

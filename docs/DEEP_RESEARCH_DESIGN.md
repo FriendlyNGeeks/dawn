@@ -486,9 +486,14 @@ loop (round = 1..budget):   [ the FETCH middle — bare session, NO private memo
                {brief, top-K open questions, per-question rolled-up claim summary, last revision prose}  (§4a)
   dispatch:    core_text_input_dispatch(session, directive, …, &opts)   with opts.skip_prompt_rebuild = true
                tool set = read-only allowlist {search, url_fetch, research_record, research_plan}  (§7,§11)
+               the round's tool loop: LLM_TOOLS_MAX_ITERATIONS steps that may look things up, then one SAVE
+               step (session turn_save_note): a note says it only records, tools stay on, only state-kind
+               calls run (search/url_fetch/result_read refused), and the round ends after it with no reply.
+               research_conclude ends the round on its own step (skip_followup): no call follows it
   ingest:      research_record calls this round have written claims (distinct-URL) + question updates to SQLite
   meter:       accumulate input_tokens / tool_calls into research_runs   (budget enforcement)
-  revise:      LLM's round output → (debug-gated) research_report_revisions ; emit research_round event
+  (no revise): the round's text output is discarded — a round is for the claims it records; the one
+               research_report_revisions row is the synthesized report, written after the loop
   decide:      controller reads the ledger + budgets → continue | stop   (P0: budgets + all-closed; P1: full — §6)
 synthesize (back edge): render report = view over research_claims (from SQLite), framed for the user in a
                         persona-carrying context → notes store (§8)   [ "Friday knows you" again — safe, post-fetch ]
@@ -589,7 +594,7 @@ a free inheritance.
 Reuses the background-job manager primitives (`BACKGROUND_JOBS_DESIGN.md §5`) but via a **sibling worker with
 its own spawn path** (arch MED-2), not `job_worker`'s `handle_spawn`:
 
-1. **Spawn** (`deep_research start`, [§7](#7-tools)): `memory_filter_check(brief)` → capacity peek
+1. **Spawn** (`deep_research start`, [§7](#7-tools)): `memory_filter_injection_command_match(brief)` → capacity peek
    `job_manager_capacity` → `conv_db_create_job(...)` with `job_kind='research'` (status `queued`) →
    `job_update_emit` **before** dispatch → detached `research_worker_spawn(user_id, conv_id, brief, mode)`.
    `INSERT research_runs` (status `planning`). No change to `job_worker.c`.
@@ -634,6 +639,13 @@ self-assessment (a model deep in a polluted context is unreliable about whether 
 > stopped at 22/23 on the 40-call cap while tokens and rounds had room). The two real fuses are now
 > **`max_input_tokens` (cost) + `max_rounds` (loop depth)** (+ the `[jobs]` runtime reap for wall-clock). The
 > config field stays parsed/round-tripped for back-compat but is unenforced and out of the panel.
+>
+> **The per-round call bound is `LLM_TOOLS_MAX_ITERATIONS + 1` provider calls.** The last of them is a save
+> step, not an answer: the tool loop appends a note (`RESEARCH_ROUND_LAST_STEP_NOTE`), keeps the tools on, lets
+> only state-kind calls run (the policy narrows every call to its save-step row, `tool_call_policy.h`), and ends the round after them
+> with an empty reply and no further call. So the last lookup step's results can still be recorded, and a round
+> never pays for an answer nothing reads. A round that hits its input-token ceiling at that step stops before
+> the save, as at any step.
 
 Layered stopping stack, outermost first:
 
@@ -704,6 +716,11 @@ Layered stopping stack, outermost first:
 **Effort scaling (P1)** — a prompt-level budget policy à la Anthropic sizes the **initial question count** and
 per-round K against the tool budget, so a broad brief doesn't generate more questions than `min_sources ×
 count` fetches can close before budget death (eff L3), and simple briefs don't overinvest.
+
+Each round's directive ends with its step budget, as facts only (`RESEARCH_ROUND_STEP_BUDGET_TEMPLATE`): how
+many steps can search, fetch and record, that the last step only records, and that a step is one reply that
+can carry several tool calls. It states no policy (no instruction to batch); the model sizes its own work
+against it. The directive is model input, so the line affects how the model paces a round.
 
 **Clarification at spawn (P1)** — the first thing OpenAI DR does. If the brief is ambiguous, `deep_research
 start` returns a clarifying question to the user *before* spawning the job. The spawn ack also carries the plan
@@ -888,7 +905,7 @@ Wall-clock ceiling reuses the `[jobs]` runtime reap rather than a duplicate knob
 1. **Owner-scoped, structurally.** No research read path accepts a raw `run_id` without also taking `user_id`
    and JOINing `research_runs` (sec MED-4). `status`/`cancel` validate ownership exactly as `job_tool.c:219`
    (`AUTH_DB_FORBIDDEN`). No cross-user visibility.
-2. **Authorization inherits the job path.** `deep_research start` runs the same authorize + `memory_filter_check`
+2. **Authorization inherits the job path.** `deep_research start` runs the same authorize + injection-command check
    + capacity gate as `job spawn`. A research run *is* a background job and obeys `[jobs]` concurrency caps.
 3. **Ledger lifecycle** ([§3](#3-data-model)): claims + questions kept until the parent conversation is
    deleted; only report revisions pruned (after replay verification).
@@ -1247,7 +1264,7 @@ So P0 of this feature extracts the post-confirm body into a shared non-static
 **`research_spawn_run(user_id, parent_conv, brief, mode, deliver_to, &run_id, &conv_id, &err)`**, called by
 **both** `handle_start` (after its confirm gate; since 2026-10-03 the separate `confirm_start` action,
 `handle_confirm_start`) and the admin handler. Only then is "changes nothing about the
-loop / allowlist / gates" literally true rather than aspirational. `memory_filter_check(brief)` lives inside the
+loop / allowlist / gates" literally true rather than aspirational. `memory_filter_injection_command_match(brief)` lives inside the
 shared function, so it fires on both paths by construction.
 
 **The `research` admin verb** (`src/auth/admin_socket_research.c` — GPL header per CLAUDE.md — mirroring the
@@ -1300,7 +1317,7 @@ gate** — and that is correct, not a hole (confirmed by security review against
   cost-envelope half is preserved by [§16.7](#167-cost--methodology). "Operator" here means anyone in the
   daemon's group — the population being authorized; name it, don't widen it.
 - It bypasses **only** the conversational confirm + the LLM routing decision. Every other control still fires:
-  `[research] enabled`, `memory_filter_check(brief)` (inside the shared spawn), `[jobs]` caps, owner-scoping, the
+  `[research] enabled`, `memory_filter_injection_command_match(brief)` (inside the shared spawn), `[jobs]` caps, owner-scoping, the
   read-only in-loop allowlist, ingest-time injection gating, and the disabled `reinvoke_parent`. Decision #17's
   "never autonomously" is about the *model*; an operator-initiated spawn is not the model acting.
 
@@ -1371,7 +1388,7 @@ touches C and a re-score never re-runs research.
 1. **Extract `research_spawn_run()`** (the load-bearing step, arch HIGH-1) — pull the post-confirm body of
    `handle_start` (`deep_research_tool.c`) into a shared non-static function called by both `handle_start` (after
    its confirm gate; now `handle_confirm_start`) and the new admin handler, preserving the exact ordering (fail-closed `job_kind` stamp,
-   `research_db_run_create` before spawn). `memory_filter_check(brief)` lives inside it. Zero behaviour change to
+   `research_db_run_create` before spawn). `memory_filter_injection_command_match(brief)` lives inside it. Zero behaviour change to
    the conversational path.
 2. **`admin_socket_research.c`** (GPL header) — the `research start`/`status`/`cancel` verb, wired into the admin
    dispatch like the sibling `admin_socket_*` modules: `ADMIN_MSG_RESEARCH_*` enum, handler module, client parse

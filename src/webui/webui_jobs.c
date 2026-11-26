@@ -56,6 +56,7 @@
 #include "config/dawn_config.h"
 #include "core/job_manager.h"
 #include "core/job_worker.h"
+#include "llm/llm_selection.h" /* LLM_SELECTION_REASON_MAX */
 #include "logging.h"
 #include "utils/string_utils.h"
 #include "webui/webui_internal.h"
@@ -125,6 +126,10 @@ static json_object *job_to_json(const job_record_t *r) {
    }
    if (error[0]) {
       json_object_object_add(j, "error", json_object_new_string(error));
+   }
+   /* A coding job's card asks the gateway what it waits on (coding_pending). */
+   if (strcmp(r->job_kind, JOB_KIND_CODING) == 0) {
+      json_object_object_add(j, "kind", json_object_new_string(JOB_KIND_CODING));
    }
    return j;
 }
@@ -197,6 +202,19 @@ void webui_broadcast_jobs_invalidate(int user_id) {
  * Inbound: jobs_request -> jobs_snapshot (the complete active set)
  * ============================================================================= */
 
+/* A list frame that couldn't be built answers anyway, with `success: false` and
+ * no `jobs`: a silent drop would leave the client unable to tell a failed read
+ * from one still on its way, and keep showing counts that may be stale. */
+static void send_list_failure(ws_connection_t *conn, const char *type, const char *error) {
+   json_object *payload = json_object_new_object();
+   if (!payload) {
+      return;
+   }
+   json_object_object_add(payload, "success", json_object_new_boolean(false));
+   json_object_object_add(payload, "error", json_object_new_string(error));
+   send_frame(conn, type, payload);
+}
+
 void webui_jobs_send_snapshot(ws_connection_t *conn) {
    if (!conn || !conn->session || !conn->authenticated || conn->is_satellite ||
        conn->auth_user_id <= 0) {
@@ -222,6 +240,7 @@ void webui_jobs_send_snapshot(ws_connection_t *conn) {
    job_record_t *rows = calloc((size_t)query_max, sizeof(*rows));
    if (!rows) {
       OLOG_ERROR("webui_jobs: snapshot alloc failed (%d rows)", query_max);
+      send_list_failure(conn, "jobs_snapshot", "Couldn't read your background jobs.");
       return;
    }
 
@@ -230,6 +249,7 @@ void webui_jobs_send_snapshot(ws_connection_t *conn) {
        AUTH_DB_SUCCESS) {
       free(rows);
       OLOG_WARNING("webui_jobs: active-list read failed for user %d", conn->auth_user_id);
+      send_list_failure(conn, "jobs_snapshot", "Couldn't read your background jobs.");
       return;
    }
 
@@ -248,6 +268,7 @@ void webui_jobs_send_snapshot(ws_connection_t *conn) {
    for (int i = 0; i < emit; i++) {
       json_object_array_add(arr, job_to_json(&rows[i]));
    }
+   json_object_object_add(payload, "success", json_object_new_boolean(true));
    json_object_object_add(payload, "jobs", arr);
    json_object_object_add(payload, "truncated", json_object_new_boolean(truncated));
    if (truncated) {
@@ -281,6 +302,7 @@ void webui_jobs_send_history(ws_connection_t *conn,
    job_record_t *rows = calloc((size_t)limit, sizeof(*rows));
    if (!rows) {
       OLOG_ERROR("webui_jobs: history alloc failed (%d rows)", limit);
+      send_list_failure(conn, "list_jobs_response", "Couldn't read your finished jobs.");
       return;
    }
 
@@ -289,6 +311,7 @@ void webui_jobs_send_history(ws_connection_t *conn,
                                         limit, &n) != AUTH_DB_SUCCESS) {
       free(rows);
       OLOG_WARNING("webui_jobs: history read failed for user %d", conn->auth_user_id);
+      send_list_failure(conn, "list_jobs_response", "Couldn't read your finished jobs.");
       return;
    }
 
@@ -297,6 +320,7 @@ void webui_jobs_send_history(ws_connection_t *conn,
    for (int i = 0; i < n; i++) {
       json_object_array_add(arr, job_to_json(&rows[i]));
    }
+   json_object_object_add(payload, "success", json_object_new_boolean(true));
    json_object_object_add(payload, "jobs", arr);
    /* A full page means there MAY be more; the cursor is the last row's sort key,
     * so the follow-up request resumes exactly where this page stopped even if
@@ -368,9 +392,21 @@ void webui_jobs_handle_action(ws_connection_t *conn, json_object *payload) {
        * caller forge log lines (and flood them, since this fires on every probe). */
       const char *safe = (strcmp(action, "cancel") == 0)   ? "cancel"
                          : (strcmp(action, "resume") == 0) ? "resume"
+                         : (strcmp(action, "delete") == 0) ? "delete"
                                                            : "unknown";
       OLOG_WARNING("webui_jobs: user %d denied '%s' on conv %lld (rc=%d)", conn->auth_user_id, safe,
                    (long long)conv_id, grc);
+      return;
+   }
+
+   if (strcmp(action, "delete") == 0) {
+      /* The conversation delete's own checks (still running; a coding job whose
+       * work the gateway holds), then every tab drops the row. */
+      const char *err = webui_delete_conversation(conn, conv_id);
+      send_action_result(conn, action, conv_id, err == NULL, err ? err : "Deleted.");
+      if (err == NULL) {
+         webui_broadcast_jobs_invalidate(conn->auth_user_id);
+      }
       return;
    }
 
@@ -410,7 +446,9 @@ void webui_jobs_handle_action(ws_connection_t *conn, json_object *payload) {
        * click in an authenticated browser, so the caller is a person changing
        * their mind, and a cancelled job is resumable here.  The tool path passes
        * BY_TOOL so the model cannot undo a stop the user asked for. */
-      switch (job_worker_resume(conv_id, conn->auth_user_id, JOB_RESUME_ORIGIN_USER)) {
+      char refused[LLM_SELECTION_REASON_MAX] = "";
+      switch (job_worker_resume(conv_id, conn->auth_user_id, JOB_RESUME_ORIGIN_USER, refused,
+                                sizeof(refused))) {
          case JOB_RESUME_STARTED:
             send_action_result(conn, action, conv_id, true, "Resuming.");
             return;
@@ -426,6 +464,9 @@ void webui_jobs_handle_action(ws_connection_t *conn, json_object *payload) {
             return;
          case JOB_RESUME_FAILED:
             send_action_result(conn, action, conv_id, false, "Could not restart that job.");
+            return;
+         case JOB_RESUME_NOT_RUNNABLE:
+            send_action_result(conn, action, conv_id, false, refused);
             return;
          case JOB_RESUME_NOTHING_TO_RUN:
             send_action_result(conn, action, conv_id, false,

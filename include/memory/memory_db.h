@@ -681,7 +681,8 @@ int memory_db_prune_low_confidence(int user_id, float threshold, int *count_out)
 int memory_db_prune_old_summaries(int user_id, int retention_days, int *count_out);
 
 /**
- * @brief Get all user IDs that have memory data
+ * @brief Get all user IDs that have memory data (facts, preferences or
+ *        entities: one left only orphan entities still needs the sweep)
  *
  * @param out_ids Output: array of user IDs (caller allocates)
  * @param max_ids Maximum IDs to return
@@ -1128,7 +1129,8 @@ int memory_db_get_last_extracted(int64_t conversation_id, int *count_out);
  * the cursor passes are never read again.
  *
  * @param conversation_id Conversation ID
- * @param message_count Message count to record (legacy count-based cursor)
+ * @param message_count Message count to record when @p last_msg_id is 0; an
+ *        advance records the conversation's rows through @p last_msg_id
  * @param last_msg_id Highest message ID processed; 0 = do not advance cursor
  * @param outside What the rows passed read (outside_kind_t; OUTSIDE_NONE: nothing)
  * @return MEMORY_DB_SUCCESS or MEMORY_DB_FAILURE

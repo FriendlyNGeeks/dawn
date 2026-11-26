@@ -426,7 +426,14 @@
       if (!elements.panel) return;
 
       isOpen = false;
+      // The closed panel is out of the tab order: focus inside it goes back to
+      // the button that opens it.
+      const hadFocus = elements.panel.contains(document.activeElement);
       elements.panel.classList.add('hidden');
+      if (hadFocus) {
+         const opener = document.getElementById('music-btn');
+         if (opener) opener.focus();
+      }
       DawnStore.setBool(DawnStore.KEYS.MUSIC_PANEL_OPEN, false);
       if (musicEscToken !== null) {
          DawnEscStack.unregister(musicEscToken);
@@ -1394,7 +1401,7 @@
       const html = albums
          .map(
             (album) => `
-         <li class="music-library-item" data-album="${escapeAttr(album.name)}" data-album-key="${escapeAttr(album.key || '')}">
+         <li class="music-library-item" data-album="${escapeAttr(album.name)}" data-album-key="${escapeAttr(album.key || '')}" data-album-artist="${escapeAttr(album.artist || '')}">
             <div class="music-library-item-info">
                <div class="music-library-item-title">${escapeHtml(album.name)}</div>
                <div class="music-library-item-artist">${escapeHtml(album.artist || 'Unknown')} \u2022 ${album.track_count} track${album.track_count !== 1 ? 's' : ''}</div>
@@ -1425,11 +1432,13 @@
       items.forEach((item) => {
          const albumName = item.dataset.album;
          const albumKey = item.dataset.albumKey;
+         const albumArtist = item.dataset.albumArtist;
 
          // Drill-down to show album's tracks
          function drillIntoAlbum() {
             const payload = { type: 'tracks_by_album', album: albumName };
             if (albumKey) payload.album_key = albumKey;
+            if (albumArtist) payload.artist = albumArtist;
             DawnWS.send({ type: 'music_library', payload });
          }
 
@@ -1453,6 +1462,7 @@
                e.stopPropagation();
                const addPayload = { album: albumName };
                if (albumKey) addPayload.album_key = albumKey;
+               if (albumArtist) addPayload.artist = albumArtist;
                DawnMusicPlayback.control('add_album', addPayload);
                addBtn.textContent = '\u2713';
                setTimeout(() => {

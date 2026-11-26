@@ -246,6 +246,24 @@ bool research_is_natural_end(const char *stop_reason);
 int research_critic_parse_verdict(const char *response, research_critic_verdict_t *out);
 
 /**
+ * @brief The completion message a finished run posts into the chat it came from.
+ *
+ * Sized to its parts, so nothing cuts the take or the closing line.
+ *
+ * @param label       What the run is called, for the user: the report's title in
+ *                    their notes, or the job's title.  Not the brief, which is
+ *                    written for the research agent.
+ * @param summary     The take or excerpt to lead with (NULL or empty: none).
+ * @param claim_count Findings recorded.
+ * @param has_report  The cited report was saved to the user's notes.
+ * @return The message (caller frees), or NULL when out of memory.
+ */
+char *research_completion_message(const char *label,
+                                  const char *summary,
+                                  int claim_count,
+                                  bool has_report);
+
+/**
  * @brief Render the BOUNDED per-round digest into @p out (§4a.2).
  *
  * Emits, capped at @p b->round_digest_max_chars: the brief, the top-K open
@@ -334,9 +352,8 @@ char *research_canonicalize_url(const char *in, char *out, size_t out_size);
  * bounded digest + dispatch with skip_prompt_rebuild + meter tokens + refresh
  * coverage + stop decision } → synthesize (no-tools LLM turn writes the answer from
  * the evidence → final revision + notes + job-conversation copy).
- * The session MUST already be a bare SESSION_TYPE_JOB session (job_manager_begin)
- * run native-tools-only with legacy <command> execution disabled — the read-only
- * allowlist gates only the native tool path (§11 HIGH-1).
+ * The session MUST already be a bare SESSION_TYPE_JOB session (job_manager_begin);
+ * the read-only allowlist gates its tool calls (§11 HIGH-1).
  *
  * The caller (research_worker) owns the session lifecycle + the terminal job
  * transition; this returns the terminal stop_reason.

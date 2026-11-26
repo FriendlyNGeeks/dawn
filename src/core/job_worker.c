@@ -35,6 +35,7 @@
 #include <time.h>
 
 #include "auth/auth_db.h"
+#include "auth/auth_db_conv_prefix.h" /* conv_db_retract_envelope */
 #include "auth/auth_db_messages.h"
 #include "core/conv_event.h"
 #include "core/event_payload.h"
@@ -44,11 +45,11 @@
 #include "core/text_input_dispatch.h"
 #include "dawn_error.h"
 #include "llm/llm_interface.h"
+#include "llm/llm_selection.h"
 #include "llm/llm_turn_blocks.h"
 #include "logging.h"
 #include "memory/memory_history_loader.h"
 #include "prompts.h"
-#include "webui/webui_server.h" /* webui_tool_iteration_cb — bubble-seal hook (jobs run only in WebUI builds) */
 
 /* Work item handed to the detached worker thread. */
 typedef struct {
@@ -64,7 +65,16 @@ typedef struct {
 
 static void job_worker_run(job_work_t *work) {
    session_t *s = NULL;
-   int rc = job_manager_begin(work->user_id, work->conv_id, job_provider_from_default(), &s);
+   /* The LLM stored when the job was spawned, applied below for every run. */
+   session_llm_config_t llm;
+   if (job_selection_load(work->conv_id, work->user_id, &llm) != AUTH_DB_SUCCESS) {
+      job_manager_set_terminal(work->conv_id, work->user_id, "failed",
+                               "couldn't read the job's model", time(NULL), 0);
+      job_manager_mark_dirty();
+      OLOG_WARNING("job_worker: could not read conv %lld's model", (long long)work->conv_id);
+      return;
+   }
+   int rc = job_manager_begin(work->user_id, work->conv_id, job_provider_for(&llm), &s);
    if (rc != JOB_MGR_OK) {
       /* The tool checks caps before creating the row, but guard the race. */
       const char *err = (rc == JOB_MGR_CAP_GLOBAL || rc == JOB_MGR_CAP_PROVIDER ||
@@ -88,6 +98,7 @@ static void job_worker_run(job_work_t *work) {
       job_manager_end(s);
       return;
    }
+   session_set_llm_config(s, &llm);
    /* queued -> running is a state change WITHIN the active set, so it changes no
     * count — but without it a watcher's row reads 'queued' with started_at 0 for
     * the job's whole runtime, and an elapsed timer computed off that renders
@@ -109,13 +120,17 @@ static void job_worker_run(job_work_t *work) {
     * confident non-answer, marked the job `done`, and — because `done` is not
     * resumable — destroyed the retry.  Observed live on conv 970, which is why
     * v74 made the goal durable at creation. */
+   bool continued = false; /* a resume carrying on a restored transcript */
    if (work->resume) {
-      bool continued = false;
       size_t restored = 0;
+      /* Read before the load: the turn's catch-up pulls what lands after. */
+      conv_sync_point_t at;
+      const bool at_ok = conv_db_sync_point_get(work->conv_id, work->user_id, &at) ==
+                         AUTH_DB_SUCCESS;
       struct json_object *hist = memory_history_load_for_llm(work->conv_id, work->user_id,
                                                              &restored);
       if (hist != NULL && restored > 0) {
-         session_replace_history(s, hist, work->conv_id);
+         session_replace_history_at(s, hist, work->conv_id, work->user_id, at_ok ? &at : NULL);
          continued = true;
          OLOG_INFO("job_worker: resuming conv %lld with %zu bytes of history — continuing",
                    (long long)work->conv_id, restored);
@@ -140,10 +155,10 @@ static void job_worker_run(job_work_t *work) {
 
       /* Durable boundary marker in the event stream: without it a tailer sees
        * complete{interrupted} → status{generating} → fresh tool_calls with nothing
-       * marking the restart, and the transcript renderer (CP4b) would draw the
-       * JOB_RESUME_DIRECTIVE as if the user typed it.  The message role stays
-       * `user` (the provider needs a user turn); the renderer draws the boundary
-       * off this event instead. */
+       * marking the restart, and the transcript renderer (CP4b) would not draw
+       * the restart at all.  The directive itself is sent as an envelope (below):
+       * a `user` turn to the provider, request context everywhere else, so no
+       * transcript shows it as something the user typed. */
       struct json_object *pj = json_object_new_object();
       char *payload = NULL;
       if (pj != NULL) {
@@ -169,6 +184,10 @@ static void job_worker_run(job_work_t *work) {
 
    text_input_dispatch_opts_t opts = {
       .conversation_id = work->conv_id, /* persist the goal (user msg) to the job conv */
+      /* A continued resume's JOB_RESUME_DIRECTIVE is DAWN's words, not the
+       * user's: saved and replayed as request context.  A resume that restarts
+       * from the stored goal sends the user's goal, an ordinary question. */
+      .question_kind = continued ? MESSAGE_KIND_ENVELOPE : MESSAGE_KIND_NONE,
       .auth_user_id = work->user_id,
       .sentence_cb = NULL, /* no TTS — text-only job */
       .sentence_userdata = NULL,
@@ -176,6 +195,10 @@ static void job_worker_run(job_work_t *work) {
       .user_msg_added_ctx = NULL,
       .channel_hint = NULL,
    };
+   /* An LLM that can't run: the job fails with the reason, which its notice shows. */
+   char refusal[LLM_SELECTION_REASON_MAX];
+   opts.refusal = refusal;
+   opts.refusal_len = sizeof(refusal);
    /* First run: frame the goal with the deliverable contract so the answer comes
     * back as the final message, not saved off as a document.  A resume already
     * carries this — its restored history holds the framed first turn, and it gets
@@ -323,6 +346,18 @@ static void job_worker_run(job_work_t *work) {
       conv_event_notify_message_appended(work->conv_id, work->user_id, final_msg_id, "assistant",
                                          response, NULL, atomic_load(&s->current_stream_id));
    }
+   /* A resume that produced nothing takes its directive back (and the context
+    * sent with it), so failed resumes don't pile up copies the next one replays.
+    * Kept when anything was saved after it (a tool exchange: work the next
+    * attempt sees).  The job session's own history ends with it. */
+   if (continued && !have_answer) {
+      const int64_t envelope = session_turn_envelope_id(s);
+      if (envelope > 0 &&
+          conv_db_retract_envelope(work->conv_id, work->user_id, envelope) == AUTH_DB_SUCCESS) {
+         OLOG_INFO("job_worker: took back the unanswered directive of conv %lld",
+                   (long long)work->conv_id);
+      }
+   }
    session_turn_end(s);
 
    /* `shutdown_stop` (the daemon pulled the rug, vs a human asking for the stop) was
@@ -369,9 +404,10 @@ static void job_worker_run(job_work_t *work) {
       job_manager_set_terminal(work->conv_id, work->user_id, "failed", JOB_ERR_TIMED_OUT, now, 0);
       OLOG_WARNING("job_worker: job conv %lld timed out (reaped)", (long long)work->conv_id);
    } else {
-      job_manager_set_terminal(work->conv_id, work->user_id, "failed", "no response from model",
-                               now, 0);
-      OLOG_WARNING("job_worker: job conv %lld failed (empty response)", (long long)work->conv_id);
+      job_manager_set_terminal(work->conv_id, work->user_id, "failed",
+                               refusal[0] ? refusal : "no response from model", now, 0);
+      OLOG_WARNING("job_worker: job conv %lld failed (%s)", (long long)work->conv_id,
+                   refusal[0] ? refusal : "empty response");
    }
    free(response);
 
@@ -403,7 +439,11 @@ static int job_worker_spawn_resume(int user_id, int64_t conv_id) {
    return job_worker_spawn_ex(user_id, conv_id, JOB_RESUME_DIRECTIVE, true);
 }
 
-job_resume_result_t job_worker_resume(int64_t conv_id, int user_id, job_resume_origin_t origin) {
+job_resume_result_t job_worker_resume(int64_t conv_id,
+                                      int user_id,
+                                      job_resume_origin_t origin,
+                                      char *reason,
+                                      size_t reason_len) {
    if (conv_id <= 0 || user_id <= 0) {
       return JOB_RESUME_NOT_FOUND;
    }
@@ -423,7 +463,11 @@ job_resume_result_t job_worker_resume(int64_t conv_id, int user_id, job_resume_o
    /* Fail before mutating.  job_manager_begin enforces the caps regardless, but
     * only by resetting the row and then immediately failing it, which reads to
     * the user as "resuming broke the job". */
-   if (job_manager_capacity(user_id, job_provider_from_default()) != JOB_MGR_OK) {
+   session_llm_config_t llm;
+   if (job_selection_load(conv_id, user_id, &llm) != AUTH_DB_SUCCESS) {
+      return JOB_RESUME_FAILED;
+   }
+   if (job_manager_capacity(user_id, job_provider_for(&llm)) != JOB_MGR_OK) {
       return JOB_RESUME_CAPACITY;
    }
 
@@ -434,6 +478,15 @@ job_resume_result_t job_worker_resume(int64_t conv_id, int user_id, job_resume_o
     * reads 'queued' with no worker until the failure path retires it. */
    if (job_manager_conv_is_live(conv_id)) {
       return JOB_RESUME_NOT_RESUMABLE;
+   }
+
+   /* Resume is a pick the user makes now: the job's LLM is checked now.  A live
+    * job says so first; a job in a state the claim refuses (done) may be told
+    * about its LLM instead, harmlessly: nothing has changed yet. */
+   session_llm_config_t resolved = llm;
+   llm_selection_resolve(&resolved);
+   if (llm_selection_problem(&resolved, reason, reason_len) != 0) {
+      return JOB_RESUME_NOT_RUNNABLE;
    }
 
    /* There must be SOMETHING to run: either a transcript to continue, or the

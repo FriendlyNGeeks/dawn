@@ -410,11 +410,34 @@
                options: ['cloud', 'local'],
                hint: 'Server default: cloud uses APIs, local uses llama-server. Users can override per-session.',
             },
+            cloud_provider: {
+               type: 'select',
+               label: 'Cloud Provider',
+               configPath: 'llm.cloud.provider',
+               options: [
+                  { value: '', label: 'Not selected' },
+                  'openai',
+                  'claude',
+                  'gemini',
+                  'openrouter',
+               ],
+               showWhen: { key: 'llm.type', value: 'cloud' },
+               hint: 'Which cloud service handles chat. A provider\'s API key is used only when it is selected here; Not selected uses the local LLM. OpenRouter fronts many vendors via one key — its model list uses "vendor/model" IDs.',
+            },
+            local_fallback: {
+               type: 'checkbox',
+               label: 'Fall Back to the Local LLM',
+               showWhen: { key: 'llm.type', value: 'cloud' },
+               hint: "When the cloud provider can't be reached (or keeps failing), answer from the Local Settings endpoint instead (a voice turn, a chat, a satellite or a message; not background jobs). The first such reply says so, and the cloud is tried again after a minute, then less often while it stays down. Turn on only for a local LLM you run. An http:// endpoint on another machine carries the whole conversation unencrypted, and anyone who can cut this machine's internet connection can make DAWN use it: prefer https or a server on this machine.",
+            },
             max_tokens: {
                type: 'number',
                label: 'Max Tokens',
                min: 100,
-               hint: 'Maximum tokens in LLM response',
+               hint:
+                  'Maximum tokens in an LLM response. A streamed reply that reasons gets at ' +
+                  "least its effort's ceiling (low 16K, medium 32K, high 64K, xhigh/max 128K), " +
+                  "within the model's maximum.",
                advanced: true,
             },
             cloud: {
@@ -422,17 +445,11 @@
                label: 'Cloud Settings',
                advanced: true,
                fields: {
-                  provider: {
-                     type: 'select',
-                     label: 'Provider',
-                     options: ['openai', 'claude', 'gemini', 'openrouter'],
-                     hint: 'Cloud LLM provider. OpenRouter fronts many vendors via one key — its model list uses "vendor/model" IDs.',
-                  },
                   endpoint: {
                      type: 'text',
                      label: 'Custom Endpoint',
                      placeholder: 'Leave empty for default',
-                     hint: 'Override API endpoint (for proxies or compatible APIs)',
+                     hint: 'Override the API endpoint of the provider selected above (for proxies or compatible APIs). Other providers keep their own URLs, so no key is sent to the wrong host.',
                   },
                   vision_enabled: {
                      type: 'checkbox',
@@ -443,7 +460,7 @@
                      type: 'model_list',
                      label: 'OpenAI Models',
                      rows: 8, // LLM_CLOUD_MAX_MODELS
-                     placeholder: 'gpt-4o\ngpt-4-turbo\ngpt-4o-mini',
+                     placeholder: 'gpt-6-luna\ngpt-6.1-terra\ngpt-6.2-sol',
                      hint: 'Available models for quick controls (one per line)',
                   },
                   openai_default_model_idx: {
@@ -463,7 +480,7 @@
                      type: 'model_list',
                      label: 'Claude Models',
                      rows: 8, // LLM_CLOUD_MAX_MODELS
-                     placeholder: 'claude-sonnet-4-20250514\nclaude-opus-4-20250514',
+                     placeholder: 'claude-haiku-5-5\nclaude-sonnet-5-5\nclaude-opus-5-5',
                      hint: 'Available models for quick controls (one per line)',
                   },
                   claude_default_model_idx: {
@@ -476,8 +493,8 @@
                      type: 'model_list',
                      label: 'Gemini Models',
                      rows: 8, // LLM_CLOUD_MAX_MODELS
-                     placeholder: 'gemini-2.5-flash\ngemini-2.5-pro\ngemini-3-flash-preview',
-                     hint: 'Available models for quick controls (one per line). 2.5+ and 3.x support reasoning.',
+                     placeholder: 'gemini-4-hydrogen\ngemini-4-carbon\ngemini-4-argon',
+                     hint: 'Available models for quick controls (one per line). 2.5 and later support reasoning.',
                   },
                   gemini_default_model_idx: {
                      type: 'model_default_select',
@@ -490,7 +507,7 @@
                      label: 'OpenRouter Models',
                      rows: 8, // LLM_CLOUD_MAX_MODELS
                      placeholder:
-                        'anthropic/claude-sonnet-4\nopenai/gpt-5.4\ngoogle/gemini-2.5-flash',
+                        'anthropic/claude-sonnet-4\nopenai/gpt-5.4\ngoogle/gemini-3.5-flash-lite',
                      hint: 'Curated shortlist shown in the header model switcher. One OpenRouter model ID per line, "vendor/model" (e.g. anthropic/claude-sonnet-4).',
                   },
                   openrouter_default_model_idx: {
@@ -2289,6 +2306,7 @@
                min: 256,
                max: 262144,
                hint: 'Max bytes of a single tool_call/tool_result event before head+tail truncation',
+               // JOBS_EVENT_CHUNK_CAP_DEFAULT in include/config/dawn_config.h
                default: 16384,
                advanced: true,
             },

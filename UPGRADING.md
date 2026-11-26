@@ -12,6 +12,172 @@ This is not a changelog: git history and the pull requests cover everything else
 
 ---
 
+## 2026-11-25 — The built-in model lists moved to the current generation
+
+**What changed.** The model lists DAWN uses when `dawn.toml` has none now name each vendor's
+current models: OpenAI `gpt-6-luna` (default), `gpt-6.1-terra`, `gpt-6.2-sol`, `gpt-6.2-astra`;
+Claude `claude-haiku-5-5` (default), `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-2`;
+Gemini `gemini-4-hydrogen` (default), `gemini-4-carbon`, `gemini-4-argon`; OpenRouter the same
+eleven, Claude Haiku 5.5 first. The older entries (GPT-5.x, Claude Haiku 4.5, Gemini 3.x) are no
+longer in the built-in lists.
+
+**What you need to do.** Nothing if your `dawn.toml` has its own `openai_models`,
+`claude_models`, `gemini_models` or `openrouter_models` (any save from the settings panel writes
+them): your lists are kept as they are. Without them, the model picker shows the new lists and
+a new conversation starts on the new default. A conversation whose model you picked keeps it;
+one that follows the default moves to the new default with it. To keep an older model, add it to
+the list and make it the default (Settings → Language Model).
+
+If you keep your own `models.toml`, it also needs the two new GPT-6.2 models, or they show no
+reasoning control. A service install reads `/usr/local/etc/dawn/models.toml`, which the
+installer doesn't overwrite: it saves the shipped copy beside it as `models.toml.new`. Copy the
+`gpt-6.2-astra` and `gpt-6.2-sol` rows from its `[openai]` and `[thinking.openai]` tables into
+yours, then restart DAWN.
+
+---
+
+## 2026-11-20 — The music library is read again once
+
+**What changed.** DAWN now stores each track's album artist, track number and disc number, so
+it can play a whole album in order. The first library scan after the upgrade reads every local
+music file again, and the first Plex sync rewrites every Plex track.
+
+**What you need to do.** Nothing. On a large library the first scan takes longer than usual,
+with more disk activity; music plays meanwhile, and albums play in track order once the scan
+has finished.
+
+---
+
+## 2026-11-20 — An API key is used only for the provider you selected
+
+**What changed.** For chat, DAWN no longer picks a cloud provider because its key is in
+`secrets.toml`, and never moves a conversation to another vendor. The provider is the one
+`[llm.cloud] provider` names (Settings → Language Model → Cloud Provider), or the one a
+conversation was switched to. (A setting that names a provider for its own job, such as
+`[memory] extraction_provider` or `[llm] compact_provider`, uses that provider's key, as before.)
+
+- With no provider set, or one set without its key, DAWN started on the local LLM, and still
+  does when none is set. But a conversation switched to the cloud (the WebUI picker, "switch to
+  cloud"), or one stored as cloud, ran on the first provider that had a key (Claude, then
+  OpenAI, Gemini, OpenRouter). Now it uses the provider that was selected, or is refused.
+- A selected provider with no key is now refused, and the reply says why ("OpenAI is selected,
+  but it has no API key"), instead of quietly running elsewhere. Many `dawn.toml` files say
+  `provider = "openai"` without anyone choosing it: older Settings pages wrote it on every save.
+- Conversations you never picked a model for now follow the default when you change it. On the
+  first start, if the default is a cloud provider, a stored conversation on exactly that provider
+  and default model is marked that way; local conversations, messaging channels and
+  conversations on another model keep their setting. This runs once: if the default is local at
+  that start, nothing is changed.
+- A model switch you ask for ("switch to the cloud") now lasts and is saved with the
+  conversation, as a pick in the model picker does, in a private conversation too. Before, a
+  switch from the local model to the cloud in a private conversation applied to that reply only.
+  "Use default model" (under Mode in the picker, and in Settings → My channels for a channel)
+  returns a conversation to following the default.
+- The `-m`/`--llm` and `-P`/`--cloud-provider` command-line options are removed, and DAWN won't
+  start with them.
+- The cloud-to-local fallback is now the setting `[llm] local_fallback`, off by default. It had
+  stopped working for chat turns anyway.
+- `[llm.cloud] endpoint` is now used for chat turns too, but only for the provider
+  `[llm.cloud] provider` names; with no provider set, it is ignored.
+
+**What you need to do.**
+- Check Settings → Language Model → Cloud Provider: pick the provider whose key you have, or
+  "Not selected" to stay on the local LLM. If you run only a local LLM, you can also set
+  `[llm] type = "local"`.
+- Remove `-m`/`-P` from any launch line, script or service file; set the same thing in
+  `dawn.toml` or Settings.
+- If you relied on DAWN answering from your local LLM when the cloud is down, turn on
+  Settings → Language Model → Fall Back to the Local LLM (`[llm] local_fallback = true`).
+- If you set `[llm.cloud] endpoint` (a proxy, Azure), make sure `[llm.cloud] provider` is set
+  to the provider it serves.
+
+---
+
+## 2026-11-19 — Agent gateway: `protected` is now `check`
+
+**What changed.** A repo's `protected` list in the agent gateway's config is now called
+`check`: files to check before publishing. Nothing was ever blocked; a task that changes one
+has it named to you before publishing. Each entry can now carry a reason, which Friday says
+with the path: `{ path = "src/auth/**", why = "who can log in and do what" }`. A plain string
+still works, with no reason.
+
+**What you need to do.** First re-run the gateway's installer, so the gateway runs the new
+code: `cd services/agent-gateway && sudo UV=$(command -v uv) ./install.sh`. A restart alone
+keeps the old code, which refuses a `check` key and fails at load.
+
+Then, optionally, in `/usr/local/etc/agent-gateway/agent-gateway.toml` (the installer keeps
+your copy) rename `protected = [...]` to `check = [...]` under each `[[repos]]` and
+`sudo systemctl restart agent-gateway`. That only silences a warning the gateway logs at every
+start: the old key still works. Reasons are optional; the shipped
+`services/agent-gateway/agent-gateway.toml` has them for the dawn repo.
+
+---
+
+## 2026-11-18 — models.toml: `[cache_pricing]` is now `[pricing]`
+
+**What changed.** `models.toml` keeps every price DAWN uses in one table per provider,
+`[pricing.<provider>]`: the base prices the memory re-extraction estimate uses (until now
+compiled into DAWN) and the prompt-cache multiples that `[cache_pricing.<provider>]` held.
+
+**What you need to do.** Nothing if you use the shipped `models.toml`. A service install
+reads `/usr/local/etc/dawn/models.toml` (`/var/lib/dawn/models.toml` is a symlink to it), and
+the installer doesn't overwrite it: it saves the shipped copy beside it as `models.toml.new`.
+Copy the `[pricing.*]` tables from `models.toml.new` into your `models.toml`, in place of its
+`[cache_pricing.*]` tables. Until you do, DAWN uses its built-in prices and logs a warning at
+every start, and any cache multiple you changed by hand is ignored until you move it into
+`[pricing]`.
+
+---
+
+## 2026-11-16 — Gemini 2.5 Flash and 2.5 Pro are retired on December 1, 2026
+
+**What changed.** Google is retiring `gemini-2.5-flash` and `gemini-2.5-pro`. From December 1,
+2026, Google answers requests to `gemini-2.5-flash` with `gemini-3.5-flash-lite`, and requests to
+`gemini-2.5-pro` with `gemini-3.8-flash`, billed at those models' rates. Neither can be picked in
+Google AI Studio any more, and only accounts that already used them can call them. Before August 2026, DAWN's default
+Gemini model list began with these two, so an install set up then may still have them in
+`dawn.toml`.
+
+**What you need to do.** In `dawn.toml`, look for `gemini-2.5-flash` and `gemini-2.5-pro` in
+`[llm.cloud] gemini_models`, in any task's model setting (`compact_model`, `[llm.silent_observe]
+model`, `[memory] extraction_model`), and `google/gemini-2.5-flash` / `google/gemini-2.5-pro` in
+`openrouter_models`. Replace `gemini-2.5-flash` with `gemini-3.5-flash-lite`, Google's named
+replacement at the same list price, and `gemini-2.5-pro` with `gemini-3.8-flash`, or edit the
+lists in the WebUI's LLM settings. Nothing else changes: DAWN keeps sending the reasoning level
+you pick, and Google maps it to the newer models' thinking levels. `gemini-2.5-flash-lite` is not
+being retired.
+
+---
+
+## 2026-11-15 — A reply's token ceiling follows its reasoning effort
+
+**What changed.** Reasoning counts toward a reply's token limit, so at a high effort a reply could
+end after its reasoning with no answer. A streamed reply that reasons, on Claude, OpenAI or Gemini,
+now gets a ceiling by its effort: low 16K, medium 32K, high 64K, xhigh and max 128K, up to the
+model's maximum (64K on Gemini). `[llm] max_tokens` is now the lowest ceiling these replies get,
+and stays the ceiling for everything else: replies without reasoning, local models, gpt-5.3, and
+calls that aren't streamed (briefings and memory extraction on Claude and on models that use Chat
+Completions; on the OpenAI Responses API, gpt-5.4 and later, every call is streamed, so these get
+their effort's ceiling too). Every cloud reply's ceiling is also held
+to the room left in the model's context window, so a long conversation's reply never asks for more
+than fits.
+
+**What you need to do.** Nothing, unless you lowered `max_tokens` to cap what reasoning replies
+cost. That no longer caps them. Lower the reasoning effort instead: it's what decides how much the
+model thinks, and with it what a reply costs.
+
+**If you already use a GPT-6 model, a Gemini 4 model or Claude Mythos.** DAWN now knows these
+models' reasoning settings and sends them the conversation's effort. Before, GPT-6 (Astra, Sol,
+6.1 Sol, 6.1 Terra, Luna) and Gemini 4 ran at the provider's default (Gemini 4 Hydrogen's is
+high), and Mythos was offered only low to high. Check the effort in the WebUI's reasoning menu.
+GPT-6 Cyber still gets no reasoning setting: OpenAI doesn't list its levels.
+
+**If you use GPT-5.6 Cyber.** DAWN took its context window to be GPT-5.6's 1,050,000 tokens; it's
+400,000. Its conversations are now compacted well before they reach that, where a long one could
+fail before.
+
+---
+
 ## 2026-11-03 — A named audio device is no longer swapped for another
 
 **What changed.** When the microphone or speaker named in `[audio] capture_device` /

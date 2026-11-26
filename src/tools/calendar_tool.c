@@ -37,6 +37,7 @@
 #include "core/strbuf.h"
 #include "core/tz.h"
 #include "core/user_tz.h"
+#include "llm/llm_tools.h"
 #include "logging.h"
 #include "tools/calendar_pick.h"
 #include "tools/calendar_rrule.h"
@@ -296,7 +297,8 @@ static char *handle_range(struct json_object *details, int user_id, const tz_t *
    const char *calendar_name = json_get_str(details, "calendar");
 
    if (!start_str) {
-      return strdup("Error: 'start' is required for range query (ISO 8601 datetime)");
+      return strdup(TOOL_RESULT_ERROR_MARK
+                    "Error: 'start' is required for range query (ISO 8601 datetime)");
    }
 
    time_t start;
@@ -372,7 +374,7 @@ static char *handle_next(struct json_object *details, int user_id, const tz_t *z
 static char *handle_search(struct json_object *details, int user_id, const tz_t *zone) {
    const char *query = json_get_str(details, "query");
    if (!query || !query[0])
-      return strdup("Error: 'query' text is required for search");
+      return strdup(TOOL_RESULT_ERROR_MARK "Error: 'query' text is required for search");
 
    const char *calendar_name = json_get_str(details, "calendar");
 
@@ -559,11 +561,11 @@ static char *write_error(int rc, const char *verb) {
 static char *handle_add(struct json_object *details, int user_id, const tz_t *zone) {
    const char *summary = json_get_str(details, "summary");
    if (!summary || !summary[0])
-      return strdup("Error: 'summary' (event title) is required");
+      return strdup(TOOL_RESULT_ERROR_MARK "Error: 'summary' (event title) is required");
 
    const char *start_str = json_get_str(details, "start");
    if (!start_str)
-      return strdup("Error: 'start' datetime is required (ISO 8601)");
+      return strdup(TOOL_RESULT_ERROR_MARK "Error: 'start' datetime is required (ISO 8601)");
 
    calendar_ical_new_t n = { .summary = summary,
                              .location = json_get_str(details, "location"),
@@ -608,6 +610,7 @@ static char *handle_add(struct json_object *details, int user_id, const tz_t *zo
                "No single writable calendar is named '%s'. Writable calendars: %s. Ask the user "
                "which one, then pass its name.",
                calendar_name ? calendar_name : "", writable[0] ? writable : "(none)");
+      llm_tools_result_third_party(TOOL_FRAME_CALENDAR); /* names a sharer wrote */
       return msg;
    }
    if (rc != CALENDAR_RC_OK)
@@ -639,6 +642,7 @@ static char *handle_add(struct json_object *details, int user_id, const tz_t *zo
                       n.rrule && n.rrule[0] ? n.rrule : "");
    if (uid[0] && pos >= 0 && pos < 640)
       snprintf(buf + pos, 640 - (size_t)pos, "\nUID: %s", uid);
+   llm_tools_result_third_party(TOOL_FRAME_CALENDAR); /* the calendar's name: a sharer's */
    return buf;
 }
 
@@ -684,7 +688,7 @@ static char *read_change(const tz_t *zone,
 static char *handle_update(struct json_object *details, int user_id, const tz_t *zone) {
    const char *uid = json_get_str(details, "uid");
    if (!uid || !uid[0])
-      return strdup("Error: 'uid' of the event to update is required");
+      return strdup(TOOL_RESULT_ERROR_MARK "Error: 'uid' of the event to update is required");
 
    calendar_ical_change_t c = CALENDAR_ICAL_CHANGE_INIT;
    char start_date[16], end_date[16];
@@ -722,7 +726,7 @@ static char *handle_update(struct json_object *details, int user_id, const tz_t 
 static char *handle_delete(struct json_object *details, int user_id, const tz_t *zone) {
    const char *uid = json_get_str(details, "uid");
    if (!uid || !uid[0])
-      return strdup("Error: 'uid' of the event to delete is required");
+      return strdup(TOOL_RESULT_ERROR_MARK "Error: 'uid' of the event to delete is required");
    const char *calendar_name = json_get_str(details, "calendar");
    struct json_object *occ = NULL;
    if (json_object_object_get_ex(details, "occurrence", &occ)) {
@@ -753,7 +757,7 @@ static char *calendar_tool_callback(const char *action, char *value, int *should
    *should_respond = 1;
 
    if (!action || !action[0])
-      return strdup("Error: action is required");
+      return strdup(TOOL_RESULT_ERROR_MARK "Error: action is required");
 
    /* 'calendars' takes no arguments, so tolerate a prose `arguments` value (a
     * model may still narrate despite the schema); every other action reads
@@ -884,15 +888,21 @@ static const treg_param_t calendar_params[] = {
  * Tool Metadata
  * ============================================================================= */
 
+/* What an event says (its title, place, who invited) and a calendar's name
+ * anyone who shares a calendar or sends an invitation may have written: the
+ * reads frame it (TOOL_FRAME_CALENDAR), as does an add's reply (it names the
+ * calendar, or the calendars to pick from); the rest is the tool's own. */
 static const tool_action_kind_entry_t s_calendar_action_kinds[] = {
-   { "calendars", TOOL_KIND_READ, NULL }, { "today", TOOL_KIND_READ, NULL },
-   { "range", TOOL_KIND_READ, NULL },     { "next", TOOL_KIND_READ, NULL },
-   { "search", TOOL_KIND_READ, NULL },
+   { "calendars", TOOL_KIND_READ, NULL, TOOL_FRAME_CALENDAR },
+   { "today", TOOL_KIND_READ, NULL, TOOL_FRAME_CALENDAR },
+   { "range", TOOL_KIND_READ, NULL, TOOL_FRAME_CALENDAR },
+   { "next", TOOL_KIND_READ, NULL, TOOL_FRAME_CALENDAR },
+   { "search", TOOL_KIND_READ, NULL, TOOL_FRAME_CALENDAR },
 };
 
 static const tool_metadata_t calendar_metadata = {
    .name = "calendar",
-   .results = TOOL_RESULTS_OUTSIDE,
+   .results = TOOL_RESULTS_OWN,
    .action_kinds = s_calendar_action_kinds,
    .action_kind_count = TOOL_KIND_COUNT(s_calendar_action_kinds),
    .device_string = "calendar",

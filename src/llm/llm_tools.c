@@ -23,9 +23,6 @@
  * This module provides native tool calling support for OpenAI, Claude, and
  * local LLMs (via llama.cpp with --jinja flag). Tools are defined once and
  * converted to provider-specific formats.
- *
- * Tool calling reduces system prompt size by ~70% and improves reliability
- * by using structured responses instead of parsing <command> tags from text.
  */
 
 #include "llm/llm_tools.h"
@@ -735,11 +732,10 @@ void llm_tools_refresh(void) {
       }
 
       /* Deep research is opt-in (costs real tokens/time): the [research] master
-       * switch gates the NATIVE schema here.  is_available() alone is NOT enough
-       * — it is consulted only in the armor block above and on the legacy
-       * <command> path, so a non-armor tool must be gated by name like search /
-       * memory or it stays advertised.  deep_research_callback also refuses at
-       * execution as a backstop for any non-schema path. */
+       * switch gates the schema here.  is_available() alone is NOT enough — it
+       * is consulted only in the armor block above, so a non-armor tool must be
+       * gated by name like search / memory or it stays advertised.
+       * deep_research_callback also refuses at execution as a backstop. */
       if (strcmp(t->name, "deep_research") == 0) {
          t->enabled = g_config.research.enabled;
       }
@@ -1072,42 +1068,6 @@ int llm_tools_set_enabled(const char *tool_name, bool enabled_local, bool enable
 
    OLOG_WARNING("Tool '%s' not found", tool_name);
    return 1; /* FAILURE - tool not found */
-}
-
-bool llm_tools_is_device_enabled(const char *device_name, bool is_remote) {
-   if (!device_name || !llm_tools_ready) {
-      return false;
-   }
-
-   pthread_mutex_lock(&llm_tools_mutex);
-
-   /* Search tools by name - tools use device_string for device name mapping */
-   for (int i = 0; i < llm_tools_count; i++) {
-      /* Check both the tool name and the device_string (underlying device) */
-      if (strcmp(llm_tools_table[i].name, device_name) == 0 ||
-          (llm_tools_table[i].device_name &&
-           strcmp(llm_tools_table[i].device_name, device_name) == 0)) {
-         /* Check if the tool is enabled at all */
-         if (!llm_tools_table[i].enabled) {
-            pthread_mutex_unlock(&llm_tools_mutex);
-            return false;
-         }
-
-         /* Check session-specific enable state */
-         bool enabled = is_remote ? llm_tools_table[i].enabled_remote
-                                  : llm_tools_table[i].enabled_local;
-         pthread_mutex_unlock(&llm_tools_mutex);
-         return enabled;
-      }
-   }
-
-   pthread_mutex_unlock(&llm_tools_mutex);
-
-   /* Device not found in tools array. Only devices with tool blocks in
-    * commands_config_nuevo.json become tools and should appear in prompts.
-    * Plain MQTT devices (like armor_display without a tool block) are NOT
-    * controllable via LLM and should return false for prompt filtering. */
-   return false;
 }
 
 /* Mark set[i]=true for each registered tool named in names[0..count). */
@@ -1575,6 +1535,11 @@ static int llm_tools_execute_from_treg(const tool_call_t *call,
    const int rc = run_resolved_call(call, meta, effective_device, action, value_buf, result);
    tl_tool_depth--;
    tool_call_policy_leave(outer);
+   if (kind == TOOL_KIND_PREPARE && result->success && !result->is_error) {
+      /* A preview the user may be answering: DAWN stages nothing unasked on it
+       * (turn_origin_unasked).  A refused one showed them nothing. */
+      turn_origin_note_prepare(session_get_command_context());
+   }
    result->third_party_forced = tl_third_party != NULL;
    result->third_party = tl_third_party ? tl_third_party : tool_third_party_frame(meta, action);
    tl_third_party = NULL;
@@ -1634,12 +1599,19 @@ static bool call_carries_tag(const tool_call_t *call) {
    return carried;
 }
 
-/* @p result neutralized (llm_context_neutralize) in place, and the
- * conversation's tag secret masked in it; a result that can't be is replaced
- * by an error rather than passed on as it came. */
+/* @p result made well-formed UTF-8, neutralized (llm_context_neutralize) in
+ * place, and the conversation's tag secret masked in it; a result that can't
+ * be is replaced by an error rather than passed on as it came.
+ *
+ * A tool can cut text at a byte width (a "%.80s", a fixed buffer) in the
+ * middle of a character, and one ill-formed byte makes a provider refuse the
+ * whole request.  The repair comes first, so the neutralizer checks the text
+ * as it is sent.  The error mark is already off by now (is_error carries it). */
 static void neutralize_result(const char *tool, tool_result_t *result) {
    session_t *ctx = session_get_command_context();
+   sanitize_utf8_for_json(result->result);
    if (result->result_extended) {
+      sanitize_utf8_for_json(result->result_extended);
       result->result_extended = session_prefix_mask_secret(ctx, llm_context_neutralize_owned(
                                                                     result->result_extended));
       if (!result->result_extended) {
@@ -2237,17 +2209,8 @@ bool llm_tools_enabled(const llm_resolved_config_t *config) {
       return true;
    }
 
-   /* No config provided - this happens during prompt building.
-    * If mode is "native" and tools are initialized, we should use
-    * the minimal prompt. The actual LLM type check happens at call time. */
-   llm_type_t type = llm_get_type();
-   if (type == LLM_LOCAL || type == LLM_CLOUD) {
-      return true;
-   }
-
-   /* LLM type not yet set (LLM_NONE during early init) - but config says
-    * native tools are enabled and tools are initialized, so return true
-    * to build the minimal prompt. Runtime calls will have proper type. */
+   /* No config provided (prompt building): native tools are on and initialized,
+    * whatever LLM the call ends up on. */
    return true;
 }
 

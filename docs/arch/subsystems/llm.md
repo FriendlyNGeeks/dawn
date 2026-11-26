@@ -23,19 +23,27 @@ Part of the [D.A.W.N. architecture](../../../ARCHITECTURE.md) — see the main d
    - Provider selection based on configuration (`OPENAI_MODEL`, `ANTHROPIC_MODEL`)
 
 - **llm_openai.c/h**: OpenAI API implementation
-   - Supports GPT-5 series, GPT-4o, GPT-4
+   - Supports the GPT-6 family, the GPT-5 series, GPT-4o, GPT-4 (gpt-5.4 and later, and gpt-6, on
+     the Responses API)
    - Supports llama.cpp local server (OpenAI-compatible endpoint)
    - Supports Ollama with runtime model switching
-   - Supports Google Gemini (via OpenAI-compatible endpoint)
+   - Supports Google Gemini 4, 3 and 2.5 (via OpenAI-compatible endpoint, whose
+     `reasoning_effort` Google maps to each model's thinking level)
    - Both blocking and streaming modes
    - Conversation history management
-   - Extended thinking support (reasoning_effort for OpenAI/Gemini models)
+   - Extended thinking support (reasoning_effort for OpenAI/Gemini models); the reply
+     ceiling follows the effort as for Claude (below)
 
 - **llm_claude.c/h**: Claude API implementation
-   - Supports Claude 4.6 Opus/Sonnet, Claude 4.5 Sonnet
+   - Supports Claude Fable 5.x, Opus/Sonnet/Haiku 5.5 and earlier; a model's thinking modes,
+     efforts and max output come from `models.toml [thinking.anthropic]`
    - Streaming support
    - Different API format than OpenAI (Messages API)
-   - Extended thinking support with configurable token budget
+   - Adaptive thinking by effort, or a configurable token budget on the models that take one
+   - A streamed reply that thinks gets `max_tokens` by its effort, up to the model's max
+     output (`llm_reply_max_tokens`, also used by OpenAI Responses and Chat Completions);
+     a call that isn't streamed keeps `[llm] max_tokens`.  Every cloud request's ceiling is then
+     held to the room the context window leaves (`llm_context_fit_reply`)
    - Full thinking content visibility (unlike OpenAI/Gemini)
 
 - **llm_streaming.c/h**: Streaming response handler
@@ -54,10 +62,12 @@ Part of the [D.A.W.N. architecture](../../../ARCHITECTURE.md) — see the main d
    - Sends complete sentences to TTS for natural phrasing
    - Reduces perceived latency (speak while generating)
 
-- **llm_command_parser.c/h**: JSON command extraction
-   - Extracts `<command>` JSON tags from LLM responses
-   - Validates JSON structure
-   - Handles malformed JSON gracefully
+- **llm_command_parser.c/h**: system-prompt pieces
+   - Builds and caches the system instructions (reply rules, tool rules when tools are on)
+   - The persona (its values and voice halves, the effective persona) and the TOOL DEFAULTS
+     line (location, units, timezone); drops a stored copy of a built-in persona
+   - Whether vision is on for the session's LLM type
+   - The effective voice-output directives (local and WebUI) and the ASR disambiguation hint
 
 - **llm_rate_limit.c/h**: Cloud API rate limiter
    - Process-wide sliding window throttle (default 40 RPM, configurable)
@@ -93,7 +103,7 @@ The builder runs for guests too (user 0: no memory, no user context).
 - **Incremental items** — the seam (`session_focus.c`, `core/focus/focus_incremental.c`) reads which items the history's earlier turn contexts show: the lines declared under `[retrieved items: N]` right after a tagged frame's `[system_time]` line, the newest line per handle winning (a withdrawn line, or a turn summarized away, shows nothing). It sends only the items that are new or changed, under that declaring line, names the rest on `[still relevant: M3, M7]`, and restates the citation reminder for both. Untrusted text has these lines defused (`llm_context_neutralize`), and an imitation of a handle that does reach the history after its newest line makes the item be sent again. Nothing is tracked beside the history, so a reload, a compaction or a forget needs no bookkeeping.
 - **Tool-loop notes** — `MESSAGE_KIND_LOOP_NOTE`, persisted with the turn.
 
-The turn's record (what it appended, the prefix and tool set it ran under, its boundary) is saved once its question row exists (`session_prefix_question_saved`, from every question writer), in one transaction (`conv_db_save_turn`). A reload rebuilds the same request (`memory_history_request_context`, `src/memory/memory_history_loader.c`): the context rows fold back in front of their questions (`llm_history_kind.c`).
+The turn's record (what it appended, the prefix and tool set it ran under, its boundary) is saved once its question row exists (`session_prefix_question_saved`, from every question writer), in one transaction (`conv_db_save_turn`). A reload rebuilds the same request (`memory_history_request_context`, `src/memory/memory_history_loader.c`): the context rows fold back in front of their questions (`llm_history_kind.c`). A reply that completed before a Stop is kept, in the history and in its row, as any reply, on turns whose caller saves the reply (WebUI text and voice, a job result re-engaging a viewed conversation). On those turns a reply the user stops (`session_stop_turn_by_user`, the WebUI's Stop) while it streams is kept as far as it streamed: the provider hands back the text and the blocks that finished (an unsigned, unfinished reasoning block and a half-written tool call are left out; Chat Completions keeps text only), the tool loop keeps them on the session, and `llm_call_finalize` adds the reply to the history marked `_stopped` and the caller saves it in `message_stopped`. The model is told at request time, in front of the user's next message (`llm_history_stopped_noted`, every builder), and the reply itself replays as saved, so live and reloaded requests match. For speech the saved text is what was shown, which can run ahead of what was heard. Any other cancel (a superseding turn, the wake word, a timeout, a teardown) saves nothing of an unfinished reply; the local mic keeps its own stop note. Memory extraction leaves stopped replies out, and a summarizer sees them marked as cut off.
 
 **Compaction.** A long history is compacted only at a turn seam, never mid tool round (a turn's reasoning is bound to its request as it stands). `src/core/session_compaction.c`:
 - **Ahead.** When a turn ends near the soft threshold, the oldest range (up to the kept last exchanges) is copied under the lock and summarized on a worker (`llm_context_summarize` → the pure core `src/llm/llm_compaction.c`: L1 → L2 → mechanical L3; a cancel stops without L3). The worker never touches the history or the database. Only rows already saved are summarized: a range ends before any message a turn record still holds, and on a saved row or a tool exchange (whose rows are found by call id).
@@ -106,13 +116,15 @@ The turn's record (what it appended, the prefix and tool set it ran under, its b
 - **Jobs.** A continuation's envelope question is a turn start the cut can land on; a continuation whose seam compacted nothing stops the job rather than fill the same context again.
 - Summaries are written from the conversation's own messages: the summarizer's input drops injected context (memory, turn context) and an earlier summary's part (it is given once, first), so a summary is on the same footing as the messages it replaces. The input is fenced by a delimiter made for each call. Every render of a summary, a stored one's on reload too, is neutralized and tag-masked, and framed as a model's record that carries no instructions. `context_expand` with no IDs shows the latest summary's original messages; a summary node of a private conversation shows only within its lineage.
 
-**Untrusted text.** Everything DAWN puts in front of the model but didn't write passes through `llm_context_neutralize()` (`src/llm/llm_context_text.c`). That covers focus items, remembered preferences and summaries, tool results (`llm_tools_execute`, the scheduler's direct briefing calls, the MQTT device-data relay; an email or a page is also framed as third-party, see Tool results), a job's title and result, device notices, and compaction summaries. Matching runs on a shadow of the text that sees through invisible characters and lookalike letters. It rewrites only the spans that imitate DAWN's framing or carry a tag-shaped string (whose digits it withholds), and keeps every other byte. It is linear in the text's length. `context_rules` tells the model that only tagged framing and system messages are DAWN's, and that text neither DAWN nor the user wrote (tool results: emails, pages, documents) is someone else's data, whose instructions it reports rather than follows (the policy Anthropic's guidance recommends; see `docs/PROMPT_INJECTION.md`). The conversation's own secret is masked in tool results, the persisted reply and compaction summaries (`session_prefix_mask_secret`). A tool call carrying it, in any encoding, is refused (`call_carries_tag`).
+**Untrusted text.** Everything DAWN puts in front of the model but didn't write passes through `llm_context_neutralize()` (`src/llm/llm_context_text.c`). That covers focus items, remembered preferences and summaries, tool results (`llm_tools_execute`, the scheduler's direct briefing calls, the MQTT device-data relay; an email or a page is also framed as third-party, see Tool results), a job's title and result, device notices, and compaction summaries. Matching runs on a shadow of the text that sees through invisible characters and lookalike letters. It rewrites only the spans that imitate DAWN's framing or carry a tag-shaped string (whose digits it withholds), and keeps every other byte. It is linear in the text's length. `context_rules` tells the model that only tagged framing and system messages are DAWN's, and that text neither DAWN nor the user wrote (tool results: emails, pages, documents) is someone else's data, whose instructions it reports rather than follows (the policy Anthropic's guidance recommends; see `docs/PROMPT_INJECTION.md`). The conversation's own secret is masked in tool results, the persisted reply and what the model said before a tool call (both get the same cleanup in `llm_response_finalize.c`, which also defuses imitated framing), and compaction summaries (`session_prefix_mask_secret`). A tool call carrying it, in any encoding, is refused (`call_carries_tag`).
 
 **Forgetting.** A user's removal (forgetting a memory, deleting one in the memory panel, forgetting a conversation, deleting or replacing a document, deleting all memories, deleting an account) is recorded by TEMP delete triggers that fire only while the removal is marked (`conv_db_withdraw_intent_begin`, `src/auth/auth_db_withdraw.c`). Nightly decay, merges and a note's re-indexing record nothing. `session_withdraw_forgotten` then withdraws each removed item from every conversation it was injected into: stored rows (`conv_db_withdraw`) and every live session's history. `scripts/check_user_removal_marked.sh` fails the build when a user-facing delete isn't marked. Its `[M<n>]` lines are rewritten, and the conversation's reasoning floor rises (pending until a turn built after the removal is saved), since earlier reasoning may repeat it. A turn built before a removal and saved after it is withdrawn as it is saved, inside `conv_db_save_turn`, and its reasoning goes behind the floor even if another session's turn has already settled it (`conversations.reasoning_floor_seq` keeps the last withdrawal that changed the conversation). Removals are ordered by the withdrawal sequence (`conv_db_withdraw_seq`, the `withdrawn_items` AUTOINCREMENT high-water mark), not by the clock. `document_chunks` ids are never reused (AUTOINCREMENT), so a removed chunk's record can't name a new one.
 
 ### Tools on the wire
 
 `llm_tools_request_tools()` (`src/llm/llm_tools_filter.c`) picks a request's tools: none on a suppressed turn, the read-only allowlist in a research session, else the conversation's tools, or the currently enabled set when it has none. A tool in force but not available here right now stays listed, is named in the directives, and is refused if called (`llm_tools_enabled_for_session`). A forced final call (iteration cap) keeps the tools with `tool_choice: none`, so the cached prefix is unchanged.
+
+A turn's last call (iteration `LLM_TOOLS_MAX_ITERATIONS`) is an answer or a save. By default it is an answer: tools off, the model replies with what it gathered. A turn whose session carries a save note (`session_set_turn_save_note`, `llm_tool_loop_params_t.save_note`; only deep-research rounds set one) ends on a save: the note is appended before the call, the call goes out with the tools on and nothing else changed (the loop passes the provider an iteration below the cap, so every request of the turn is identical in tools, system and `tool_choice`), only state-kind calls run in its batch (while the session's `turn_save_step` is set, the policy narrows every caller to the `TOOL_CALLER_SAVE_STEP` row; the advertised tools are unchanged), the duplicate-call check is skipped, and the turn ends after the batch with an empty reply and no further provider call. A tool that ends such a turn on its own step (`skip_followup`) also leaves an empty reply: its results are not streamed as one. `llm_call_finalize` takes that empty reply as the turn's expected end.
 
 **Frozen by value.** A conversation's tools are definitions, not names (`src/llm/llm_tool_defs.c`): `{name, description, parameters}`, the registry's neutral projection, rendered per provider when a request is built (Claude: `src/llm/llm_claude_tools.c`). The first turn freezes every registered definition on the prefix message. A definition must pass `llm_tool_def_valid()` (a plain name, description and schema within caps, valid UTF-8), so an MCP server's definitions are stored and replayed exactly as first sent, never re-read from a server that has since changed or gone. A runtime value set that would change a schema (the HUD's discovered elements) stays out of it: the live set goes in the standing directions and the tool's `validate_call` refuses a call outside it.
 
@@ -201,7 +213,15 @@ A/B that measured it, is in ATLAS (`dawn/archive/TOOL_RESULT_VIEWS_DESIGN.md`).
 - **Third-party frames.** An action whose result is someone else's text names its frame in the tool's
   action-kinds table (`tool_action_kind_entry_t.third_party`, or the tool's `third_party` default):
   `EMAIL CONTENT` for the email tool's read, recent, search and digest; `WEB CONTENT` for `url_fetch`
-  and `search`. A successful result goes in that frame after the neutralizer (`llm_third_party_frame`:
+  and `search`; `CALENDAR CONTENT` for the calendar's reads and its list of calendars (event text and
+  calendar names are written by whoever shares a calendar or sends an invitation). A tool whose text is
+  someone else's only on some calls names the frame from its callback instead
+  (`llm_tools_result_third_party`): the document tools frame `DOCUMENT CONTENT` when a result holds a
+  document that isn't the user's own words (`document_is_own`: another user's, or one the user hasn't
+  vouched for whose `documents.outside` kind is tainted, such as an upload or a note saved from an email), and leave the
+  user's own unframed; `document_manage`'s list is framed when it names another user's shared
+  document. A successful result goes in that frame after the
+  neutralizer (`llm_third_party_frame`:
   the conversation's tag on its lines, a first line saying the text is data), with a view's header
   ahead of it. The neutralizer defuses imitations of both frames, so a page or an email can't end its
   own. `result_read` frames a slice of a stored result the same way when the tool that stored it
@@ -293,8 +313,8 @@ Claude-configured extraction runs on direct Claude even while the main chat is o
 Other specifics: OpenRouter never routes to `/v1/responses`
 (`should_dispatch_to_responses_api` skips `openrouter.ai`); requests carry optional
 `HTTP-Referer` + `X-Title` attribution headers; a `provider="openrouter"` config with no key
-falls back to auto-detect, and a keyed aux purpose with no key **errors honestly** rather
-than silently switching providers; and `get_context_size()` best-effort-strips the `vendor/`
+is refused with the reason, as any selected provider without its key is, and an aux purpose
+with no key **errors honestly** rather than silently switching providers; and `get_context_size()` best-effort-strips the `vendor/`
 prefix to reuse the known context-window tables, else a conservative 128K default.
 
 > **History:** OpenRouter was originally a `[llm.cloud] use_openrouter` gateway *toggle* that
@@ -347,7 +367,12 @@ User Query → LLM Provider (OpenAI/Claude/Local)
                     ↓ (text chunks)
             Sentence Buffer → TTS (as sentences complete)
                     ↓ (complete response)
-            Command Parser → MQTT Commands
+            Response finalizer (llm_response_finalize: <cited> audit, [emote:]
+              strip on the local surface, <end_of_turn> cut unless the model
+              is Claude/OpenAI/Gemini at its own endpoint, trailing <cited> tag strip,
+              neutralize + conversation-tag mask)
+                    ↓ (canonical clean text)
+            Saved to the conversation history → delivered to the surface
 ```
 
 ## Performance Comparison

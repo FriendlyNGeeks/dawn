@@ -302,7 +302,8 @@ int job_manager_reap_overdue(time_t now);
  * Call it exactly once, before job_manager_end().  Idempotent, but a second call
  * returns false because the first already consumed the verdict.
  *
- * @param session The job session (NULL-safe).
+ * @param session_id The job session's id (matched like the resolver: by id, never
+ *        by pointer; an id no slot holds claims nothing).
  * @param user_cancelled_out Receives true if the cancel came from
  *        job_manager_cancel() — i.e. a human asked for it — rather than from the
  *        shutdown sweep.  Both arrive as the same `cancel_requested` flag, so
@@ -313,7 +314,7 @@ int job_manager_reap_overdue(time_t now);
  *        May be NULL.
  * @return true if this session's slot had been flagged by job_manager_reap_overdue().
  */
-bool job_manager_claim_reaped(const session_t *session, bool *user_cancelled_out);
+bool job_manager_claim_reaped(uint32_t session_id, bool *user_cancelled_out);
 
 /**
  * @brief Did this job record end as a runtime-reap timeout?
@@ -449,6 +450,42 @@ int job_manager_set_terminal(int64_t conv_id,
                              int64_t final_message_id);
 
 /**
+ * @brief job_manager_set_terminal() only while the job is still queued or
+ *        running; a job already ended is left alone and emits nothing.
+ *
+ * Also wakes the completion monitor, so the owner hears the outcome.
+ * @return AUTH_DB_SUCCESS (ended it), AUTH_DB_NOT_FOUND (already ended),
+ *         AUTH_DB_INVALID or AUTH_DB_FAILURE.
+ */
+int job_manager_set_terminal_if_active(int64_t conv_id,
+                                       int user_id,
+                                       const char *status,
+                                       const char *error_or_null,
+                                       time_t finished_at,
+                                       int64_t final_message_id);
+
+/**
+ * @brief Cancels a queued or running job of one kind that has no worker in this
+ *        pool (a coding task its gateway runs).
+ *
+ * Called with no lock held, on the canceller's thread (the WebSocket thread
+ * among them): it must not block; hand the work to another thread. The job's
+ * end is reported later, like any other; when the work can't be handed off,
+ * the hook ends the row itself (job_manager_set_terminal_if_active).
+ *
+ * Register it from the tool's init: that is before any surface can cancel, and
+ * before job_manager_init()'s boot scan, which leaves a coding job running only
+ * when its hook is registered.
+ */
+typedef void (*job_kind_cancel_fn)(int64_t conv_id, int user_id);
+
+/**
+ * @brief Route cancels of a job kind to @p fn (job_manager_cancel_or_retire()).
+ * @return SUCCESS, or FAILURE (bad args or no room).
+ */
+int job_manager_register_kind_cancel(const char *kind, job_kind_cancel_fn fn);
+
+/**
  * @brief Peek whether a new job could start now (no reservation).
  *
  * Lets the `job` tool refuse cleanly past a cap before creating the row.
@@ -460,7 +497,7 @@ int job_manager_capacity(int user_id, job_provider_class_t provider);
 
 /** Outcome of job_manager_cancel_or_retire(). */
 typedef enum {
-   JOB_CANCEL_SIGNALLED,        /**< running job was told to stop */
+   JOB_CANCEL_SIGNALLED,        /**< running job (or a kind's cancel hook) was told to stop */
    JOB_CANCEL_RETIRED,          /**< queued row never reached a worker; retired directly */
    JOB_CANCEL_ALREADY_TERMINAL, /**< already done/failed/cancelled/interrupted */
    JOB_CANCEL_FORBIDDEN,        /**< owned by a different user */

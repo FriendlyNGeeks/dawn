@@ -18,7 +18,7 @@
  * enhancements, or additions to the project. These contributions become
  * part of the project and are adopted by the project author(s).
  *
- * Unit tests for text_filter command tag stripping.
+ * Unit tests for text_filter: the reply-tag strips and text_split_pieces.
  */
 
 #include <stdio.h>
@@ -26,159 +26,22 @@
 
 #include "core/text_filter.h"
 #include "unity.h"
+#include "webui/webui_server.h" /* WEBUI_STREAM_TEXT_SIZE */
 
-static cmd_tag_filter_state_t s_state;
 static cited_tag_filter_state_t s_cited;
 
 void setUp(void) {
-   text_filter_reset(&s_state);
    text_filter_cited_reset(&s_cited);
 }
 
 void tearDown(void) {
 }
 
-/* ── helper for buffer tests ────────────────────────────────────────────── */
-
-static void filter_to_buf(const char *input, char *out, size_t out_size) {
-   text_filter_command_tags_to_buffer(&s_state, input, out, out_size);
-}
-
-/* ── tests ──────────────────────────────────────────────────────────────── */
-
-static void test_no_tags(void) {
-   char buf[128];
-   filter_to_buf("Hello world", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("Hello world", buf);
-}
-
-static void test_simple_tag_removal(void) {
-   char buf[128];
-   filter_to_buf("Hello <command>do stuff</command> world", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("Hello  world", buf);
-}
-
-static void test_tag_at_start(void) {
-   char buf[128];
-   filter_to_buf("<command>hidden</command>visible", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("visible", buf);
-}
-
-static void test_tag_at_end(void) {
-   char buf[128];
-   filter_to_buf("visible<command>hidden</command>", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("visible", buf);
-}
-
-static void test_only_tag_content(void) {
-   char buf[128];
-   filter_to_buf("<command>all hidden</command>", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("", buf);
-}
-
-static void test_nested_tags(void) {
-   char buf[128];
-   filter_to_buf("<command>outer<command>inner</command></command>", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("", buf);
-}
-
-static void test_multiple_tags(void) {
-   char buf[128];
-   filter_to_buf("a<command>x</command>b<command>y</command>c", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("abc", buf);
-}
-
-static void test_streaming_across_chunks(void) {
-   char buf[128] = "";
-   int len = 0;
-
-   len = text_filter_command_tags_to_buffer(&s_state, "<com", buf, sizeof(buf));
-
-   char buf2[128] = "";
-   int len2 = text_filter_command_tags_to_buffer(&s_state, "mand>hidden</command>after", buf2,
-                                                 sizeof(buf2));
-
-   TEST_ASSERT_EQUAL_STRING("after", buf2);
-   TEST_ASSERT_EQUAL_INT(5, len2);
-   (void)len;
-}
-
-static void test_partial_tag_not_matching(void) {
-   char buf[128];
-   filter_to_buf("<comm!and>", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("<comm!and>", buf);
-}
-
-static void test_empty_input(void) {
-   char buf[128];
-   filter_to_buf("", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("", buf);
-}
-
-static void test_buffer_overflow_protection(void) {
-   char buf[5];
-   int len = text_filter_command_tags_to_buffer(&s_state, "Hello world", buf, sizeof(buf));
-   buf[sizeof(buf) - 1] = '\0';
-   TEST_ASSERT_EQUAL_INT(4, len);
-   TEST_ASSERT_EQUAL_STRING("Hell", buf);
-}
-
-static void test_reset_mid_tag(void) {
-   char buf[128];
-
-   /* Start a tag but don't finish it */
-   filter_to_buf("<command>partial", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("", buf);
-   TEST_ASSERT_TRUE(s_state.nesting_depth > 0);
-
-   /* Reset state */
-   text_filter_reset(&s_state);
-   TEST_ASSERT_EQUAL_INT(0, s_state.nesting_depth);
-   TEST_ASSERT_EQUAL_INT(0, s_state.len);
-
-   /* After reset, text passes through normally */
-   filter_to_buf("clean text", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("clean text", buf);
-}
-
-/* ── callback test ──────────────────────────────────────────────────────── */
-
-typedef struct {
-   char chunks[8][64];
-   int count;
-} capture_ctx_t;
-
-static void capture_callback(const char *text, size_t len, void *ctx) {
-   capture_ctx_t *cap = (capture_ctx_t *)ctx;
-   if (cap->count < 8 && len < 64) {
-      memcpy(cap->chunks[cap->count], text, len);
-      cap->chunks[cap->count][len] = '\0';
-      cap->count++;
-   }
-}
-
-static void test_callback_receives_chunks(void) {
-   capture_ctx_t cap = { .count = 0 };
-
-   text_filter_command_tags(&s_state, "before<command>hidden</command>after", capture_callback,
-                            &cap);
-
-   TEST_ASSERT_EQUAL_INT(2, cap.count);
-   TEST_ASSERT_EQUAL_STRING("before", cap.chunks[0]);
-   TEST_ASSERT_EQUAL_STRING("after", cap.chunks[1]);
-}
-
-static void test_deeply_nested(void) {
-   char buf[128];
-   filter_to_buf("<command><command>deep</command></command>", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("", buf);
-}
-
 /* ── <cited> memory-citation stream filter ──────────────────────────────── */
 
 /* Feed one delta; append the stripped output onto `acc`. */
 static void cited_feed(char *acc, size_t acc_size, const char *delta) {
-   char tmp[256];
+   char tmp[2048];
    text_filter_cited_tags_to_buffer(&s_cited, delta, tmp, sizeof(tmp));
    strncat(acc, tmp, acc_size - strlen(acc) - 1);
 }
@@ -287,12 +150,12 @@ static void test_cited_double_open_bracket_split(void) {
    TEST_ASSERT_EQUAL_STRING("a<", out);
 }
 
-static void test_cited_stray_bracket_in_closer(void) {
-   /* Stray '<' inside the tag body must restart the closer match, not leak. */
+static void test_cited_non_tag_content_is_text(void) {
+   /* Content outside the citation grammar ('x', a stray '<') makes it text. */
    char out[128] = "";
    cited_feed(out, sizeof(out), "a<cited>x<y</cited>b");
    cited_flush(out, sizeof(out));
-   TEST_ASSERT_EQUAL_STRING("ab", out);
+   TEST_ASSERT_EQUAL_STRING("a<cited>x<y</cited>b", out);
 }
 
 static void test_cited_near_full_false_opener(void) {
@@ -303,18 +166,322 @@ static void test_cited_near_full_false_opener(void) {
    TEST_ASSERT_EQUAL_STRING("<cited x> stays", out);
 }
 
-static void test_cited_two_blocks_one_stream(void) {
+static void test_cited_two_trailing_tags_one_stream(void) {
    char out[128] = "";
-   cited_feed(out, sizeof(out), "a<cited>M1</cited>b<cited>M2</cited>c");
+   cited_feed(out, sizeof(out), "a<cited>M1</cited><cited>M2</cited>");
    cited_flush(out, sizeof(out));
-   TEST_ASSERT_EQUAL_STRING("abc", out);
+   TEST_ASSERT_EQUAL_STRING("a", out);
 }
 
-static void test_command_double_open_bracket(void) {
-   /* Lockstep regression for the same held-'<' fix in the command filter. */
-   char buf[128];
-   filter_to_buf("5 <<command>x</command>", buf, sizeof(buf));
-   TEST_ASSERT_EQUAL_STRING("5 <", buf);
+/* Run @p in through the streaming filter in chunks of @p chunk bytes (0 = whole),
+ * then flush; the output lands in @p out. */
+static void cited_stream(const char *in, size_t chunk, char *out, size_t out_size) {
+   text_filter_cited_reset(&s_cited);
+   out[0] = '\0';
+   size_t n = strlen(in);
+   if (chunk == 0) {
+      chunk = n ? n : 1;
+   }
+   char piece[2048];
+   for (size_t i = 0; i < n; i += chunk) {
+      size_t len = (n - i < chunk) ? n - i : chunk;
+      memcpy(piece, in + i, len);
+      piece[len] = '\0';
+      cited_feed(out, out_size, piece);
+   }
+   cited_flush(out, out_size);
+}
+
+/* Through the whole-string strip and the stream, whole, byte by byte and in
+ * every two-chunk split: each gives @p want. */
+static void expect_cited(const char *in, const char *want) {
+   char buf[2048];
+   snprintf(buf, sizeof(buf), "%s", in);
+   text_filter_cited_strip(buf);
+   TEST_ASSERT_EQUAL_STRING_MESSAGE(want, buf, "whole-string strip");
+
+   char out[2048];
+   cited_stream(in, 0, out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING_MESSAGE(want, out, "stream, one chunk");
+   cited_stream(in, 1, out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING_MESSAGE(want, out, "stream, 1-byte chunks");
+   cited_stream(in, 3, out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING_MESSAGE(want, out, "stream, 3-byte chunks");
+
+   size_t n = strlen(in);
+   for (size_t cut = 1; cut < n; cut++) {
+      char head[2048];
+      memcpy(head, in, cut);
+      head[cut] = '\0';
+      text_filter_cited_reset(&s_cited);
+      out[0] = '\0';
+      cited_feed(out, sizeof(out), head);
+      cited_feed(out, sizeof(out), in + cut);
+      cited_flush(out, sizeof(out));
+      char msg[64];
+      snprintf(msg, sizeof(msg), "stream, split at %zu", cut);
+      TEST_ASSERT_EQUAL_STRING_MESSAGE(want, out, msg);
+   }
+}
+
+static void test_cited_mention_in_prose_is_kept(void) {
+   const char *backticked = "DAWN already logs my `<cited>` tags, and counts them.";
+   expect_cited(backticked, backticked);
+   const char *bare = "The model ends with a <cited> tag listing what it used.";
+   expect_cited(bare, bare);
+   const char *near_end = "That is the <cited> tag.";
+   expect_cited(near_end, near_end);
+   const char *two = "Both <cited> and </cited> appear; <cited>x is text.";
+   expect_cited(two, two);
+}
+
+static void test_cited_grammar_content_then_prose_is_kept(void) {
+   /* Content that looks like citations, then a byte no tag holds: all text. */
+   const char *in = "Write <cited>M1, M2 and so on.";
+   expect_cited(in, in);
+   const char *ids = "Like <cited>ID:12 here</cited>.";
+   expect_cited(ids, ids);
+}
+
+static void test_cited_wellformed_tags_removed(void) {
+   expect_cited("Done.<cited>M1,M4</cited>", "Done.");
+   expect_cited("Done.<cited>ID:6432</cited>", "Done.");
+   expect_cited("Done.<cited>id:6432,m3</cited>", "Done.");
+   expect_cited("Done.<cited>M1, M4</cited>", "Done.");
+   expect_cited("Done.<cited>ID : 6432,\tM 2\n</cited>", "Done.");
+   expect_cited("Done.<cited></cited>", "Done.");
+}
+
+/* A tag counts only at the end of the text. */
+static void test_cited_tag_then_more_text_is_kept(void) {
+   const char *word = "a<cited>M1</cited>word";
+   expect_cited(word, word);
+   const char *spaced = "a<cited>M1</cited>  \n more.";
+   expect_cited(spaced, spaced); /* the whitespace kept exactly too */
+   const char *two = "a<cited>M1</cited>b<cited>ID:7</cited>c";
+   expect_cited(two, two);
+   expect_cited("See <cited> here.<cited>M2</cited>", "See <cited> here.");
+}
+
+static void test_cited_trailing_tags_removed(void) {
+   expect_cited("Done.<cited>M1</cited>  \n\n", "Done.");
+   expect_cited("Done.<cited>M1</cited><cited>ID:5</cited>", "Done.");
+   expect_cited("Done.<cited>M1</cited> \n <cited>ID:5</cited>\n", "Done.");
+   expect_cited("Done.<cited>[M1]</cited >", "Done.");
+   /* Before something that only starts like an opener: text. */
+   const char *near = "Done.<cited>M1</cited> <cit";
+   expect_cited(near, near);
+   /* A following opener decides the first tag, whatever the second turns out to be. */
+   expect_cited("Done.<cited>M1</cited> <cited> is the tag.", "Done.<cited> is the tag.");
+}
+
+static void test_cited_trailing_whitespace_bound(void) {
+   char in[256] = "Done.<cited>M1</cited>";
+   for (int i = 0; i < CITED_TAG_TRAIL_WS_MAX; i++) {
+      strcat(in, " ");
+   }
+   expect_cited(in, "Done.");
+   strcat(in, "\n"); /* one more than a trailing tag may carry: text */
+   expect_cited(in, in);
+}
+
+/* What a model wrote in the stream before its tool calls ends at the flush (the
+ * message's end), so a tag ending it is dropped before the next message's text;
+ * without it the tag would still be held, and shown, when that text arrives. */
+static void test_cited_flush_ends_each_message(void) {
+   char out[256] = "";
+   cited_feed(out, sizeof(out), "Let me check.<cited>M1</cited>");
+   cited_flush(out, sizeof(out));
+   cited_feed(out, sizeof(out), "\n\n");
+   cited_feed(out, sizeof(out), "Found it.<cited>M2</cited>");
+   cited_flush(out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING("Let me check.\n\nFound it.", out);
+
+   char unflushed[256] = "";
+   cited_feed(unflushed, sizeof(unflushed), "Let me check.<cited>M1</cited>\n\nFound it.");
+   cited_flush(unflushed, sizeof(unflushed));
+   TEST_ASSERT_EQUAL_STRING("Let me check.<cited>M1</cited>\n\nFound it.", unflushed);
+}
+
+/* The reply that quoted example tags mid-text, then went on. */
+static const char k_example_reply[] =
+    "The tag in backticks: `<cited>M1,M4</cited>` and bare mid-sentence: <cited>M1,M4</cited>"
+    "\n\nIf you can read this line, the reply made it past both tags.";
+
+static void test_cited_examples_mid_reply_kept(void) {
+   expect_cited(k_example_reply, k_example_reply);
+   char with_tag[512];
+   snprintf(with_tag, sizeof(with_tag), "%s<cited>M2</cited>", k_example_reply);
+   expect_cited(with_tag, k_example_reply);
+}
+
+static void test_cited_truncated_partial_tag_dropped(void) {
+   expect_cited("The answer.<cited>M1,M", "The answer.");
+   expect_cited("The answer.<cited>", "The answer.");
+   expect_cited("The answer.<cited>M1</cit", "The answer.");
+   expect_cited("The answer.<cited>ID: 64", "The answer.");
+}
+
+/* "x<cited>" + @p run digits + @p tail into @p buf. */
+static void cited_run(char *buf, size_t size, size_t run, const char *tail) {
+   snprintf(buf, size, "x" CITED_TAG_OPEN);
+   size_t n = strlen(buf);
+   for (size_t i = 0; i < run && n + 1 < size; i++) {
+      buf[n++] = '1';
+   }
+   buf[n] = '\0';
+   strncat(buf, tail, size - n - 1);
+}
+
+static void test_cited_run_at_and_past_the_hold(void) {
+   char in[1024];
+   /* At the hold, then prose: text, every byte kept. */
+   cited_run(in, sizeof(in), CITED_TAG_HOLD_MAX, "; on.");
+   expect_cited(in, in);
+   /* One past it, then prose: the opener and the run go, the prose stays. */
+   cited_run(in, sizeof(in), CITED_TAG_HOLD_MAX + 1, "; on.");
+   expect_cited(in, "x; on.");
+   /* Ended by a '<' that isn't the closer: text goes on from that '<'. */
+   cited_run(in, sizeof(in), CITED_TAG_HOLD_MAX + 1, "</cix<cited>M1</cited>.");
+   expect_cited(in, "x</cix<cited>M1</cited>.");
+   cited_run(in, sizeof(in), CITED_TAG_HOLD_MAX + 1, "</cix<cited>M1</cited>");
+   expect_cited(in, "x</cix");
+   /* Ended by the closer: at the hold a tag mid-text is text, past it a tag. */
+   cited_run(in, sizeof(in), CITED_TAG_HOLD_MAX, "</cited>y");
+   expect_cited(in, in);
+   cited_run(in, sizeof(in), CITED_TAG_HOLD_MAX + 1, "</cited>y");
+   expect_cited(in, "xy");
+   cited_run(in, sizeof(in), CITED_TAG_HOLD_MAX, "</cited>\n");
+   expect_cited(in, "x");
+   /* Ended by the end of the text, at and past the hold: cut off, dropped. */
+   cited_run(in, sizeof(in), CITED_TAG_HOLD_MAX, "");
+   expect_cited(in, "x");
+   cited_run(in, sizeof(in), CITED_TAG_HOLD_MAX + 1, "</cit");
+   expect_cited(in, "x");
+}
+
+/* A tag citing every tool fact a turn can surface is a tag, however long. */
+static void test_cited_long_tag_of_ids_removed(void) {
+   char in[2048] = "Done." CITED_TAG_OPEN;
+   for (int i = 0; i < 96; i++) {
+      char tok[16];
+      snprintf(tok, sizeof(tok), "%sID:%d", i ? "," : "", 12000 + i);
+      strcat(in, tok);
+   }
+   strcat(in, CITED_TAG_CLOSE);
+   TEST_ASSERT_TRUE(strlen(in) > CITED_TAG_HOLD_MAX * 2);
+   expect_cited(in, "Done.");
+
+   size_t content = 0;
+   size_t tag = 0;
+   const char *t = text_filter_cited_find(in, &content, &tag);
+   TEST_ASSERT_EQUAL_PTR(in + 5, t);
+   TEST_ASSERT_EQUAL_UINT(strlen(in) - 5 - CITED_TAG_OPEN_LEN - CITED_TAG_CLOSE_LEN, content);
+   TEST_ASSERT_EQUAL_UINT(strlen(in) - 5, tag);
+}
+
+static void test_cited_bracketed_handles_removed(void) {
+   expect_cited("Done.<cited>[M1],[M4]</cited>", "Done.");
+   expect_cited("Done.<cited>[ID:6432]</cited>", "Done.");
+}
+
+static void test_cited_padded_closer_removed(void) {
+   expect_cited("Done.<cited>M1</cited >", "Done.");
+   expect_cited("Done.<cited>M1</ cited>", "Done.");
+   expect_cited("Done.<cited>M1< /cited>", "Done.");
+   expect_cited("Done.<cited>M1< / cited\t>", "Done.");
+   /* More padding than a slip carries: text. */
+   expect_cited("A <cited>M1</cited     > b", "A <cited>M1</cited     > b");
+}
+
+/* The whole-string strip and the stream agree on any mix of tag pieces, prose
+ * and runs either side of the hold (a fixed-seed generator). */
+static void test_cited_strip_and_stream_agree(void) {
+   static const char *const parts[] = { CITED_TAG_OPEN,
+                                        CITED_TAG_CLOSE,
+                                        "<",
+                                        "</ci",
+                                        "M1",
+                                        ",",
+                                        " ",
+                                        "\n",
+                                        "[",
+                                        "]",
+                                        "ID:7",
+                                        "x",
+                                        "ab.",
+                                        "< /cited >",
+                                        "<cited>M1</cited>",
+                                        "<cited>M2</cited> ",
+                                        "  \n",
+                                        "<cit" };
+   const size_t n_parts = sizeof(parts) / sizeof(parts[0]);
+   unsigned int seed = 12345;
+   for (int round = 0; round < 3000; round++) {
+      /* Room for every piece being a run: 12 * (CITED_TAG_HOLD_MAX + 1) bytes. */
+      char in[4096] = "";
+      int pieces = 1 + (int)(seed % 12);
+      for (int i = 0; i < pieces; i++) {
+         seed = seed * 1103515245u + 12345u;
+         if ((seed >> 16) % 9 == 0) {
+            size_t run = CITED_TAG_HOLD_MAX - 1 + (seed >> 8) % 3;
+            for (size_t k = 0; k < run && strlen(in) + 2 < sizeof(in) - 16; k++) {
+               strcat(in, "1");
+            }
+         } else {
+            strcat(in, parts[(seed >> 16) % n_parts]);
+         }
+      }
+      char whole[sizeof(in)];
+      snprintf(whole, sizeof(whole), "%s", in);
+      text_filter_cited_strip(whole);
+      char out[sizeof(in)];
+      cited_stream(in, 1, out, sizeof(out));
+      TEST_ASSERT_EQUAL_STRING_MESSAGE(whole, out, in);
+      cited_stream(in, 7, out, sizeof(out));
+      TEST_ASSERT_EQUAL_STRING_MESSAGE(whole, out, in);
+   }
+}
+
+static void test_cited_flush_held_bytes(void) {
+   char out[2048];
+   /* A partial opener at the end is text. */
+   cited_stream("ends <cite", 0, out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING("ends <cite", out);
+   /* A whole opener with tag content and no closer: a cut-off tag, dropped. */
+   cited_stream("ends <cited>M1", 0, out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING("ends ", out);
+   /* Held bytes that proved to be text came out before the flush, once. */
+   cited_stream("ends <cited>M1.", 0, out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING("ends <cited>M1.", out);
+   /* A whole tag held, alone or with whitespace after it: the end, dropped. */
+   cited_stream("ends <cited>M1</cited>", 0, out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING("ends ", out);
+   cited_stream("ends <cited>M1</cited> \n\t", 0, out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING("ends ", out);
+   /* A whole tag held with a partial opener after it: text, emitted. */
+   cited_stream("ends <cited>M1</cited> <ci", 0, out, sizeof(out));
+   TEST_ASSERT_EQUAL_STRING("ends <cited>M1</cited> <ci", out);
+}
+
+static void test_cited_find_reports_spans(void) {
+   size_t content = 99;
+   size_t tag = 99;
+   const char *text = "a <cited> b <cited>M1,M2</cited> ";
+   const char *t = text_filter_cited_find(text, &content, &tag);
+   TEST_ASSERT_EQUAL_PTR(text + 12, t);
+   TEST_ASSERT_EQUAL_UINT(5, content);
+   TEST_ASSERT_EQUAL_UINT(CITED_TAG_OPEN_LEN + 5 + CITED_TAG_CLOSE_LEN + 1, tag);
+   TEST_ASSERT_NULL(text_filter_cited_find("a <cited>M1</cited> c", &content, &tag));
+   t = text_filter_cited_find("a<cited>M1</cited><cited>M2</cited>", &content, &tag);
+   TEST_ASSERT_NOT_NULL(t);
+   TEST_ASSERT_EQUAL_UINT(CITED_TAG_OPEN_LEN + 2 + CITED_TAG_CLOSE_LEN, tag);
+   t = text_filter_cited_find("x<cited>M3", &content, &tag);
+   TEST_ASSERT_NOT_NULL(t);
+   TEST_ASSERT_EQUAL_UINT(2, content);
+   TEST_ASSERT_EQUAL_UINT(0, tag);
+   TEST_ASSERT_NULL(text_filter_cited_find("only a `<cited>` mention", &content, &tag));
+   TEST_ASSERT_NULL(text_filter_cited_find(NULL, &content, &tag));
 }
 
 /* ── whole-string cited strip (text_filter_cited_strip) ──────────────────── */
@@ -326,10 +493,10 @@ static void test_cited_strip_trailing_tag(void) {
    TEST_ASSERT_EQUAL_STRING("The answer is 42. ", s);
 }
 
-static void test_cited_strip_multiple_tags(void) {
+static void test_cited_strip_tags_mid_text_kept(void) {
    char s[128] = "a<cited>M1</cited>b<cited>M2</cited>c";
    text_filter_cited_strip(s);
-   TEST_ASSERT_EQUAL_STRING("abc", s);
+   TEST_ASSERT_EQUAL_STRING("a<cited>M1</cited>b<cited>M2</cited>c", s);
 }
 
 static void test_cited_strip_orphan_opener_truncates(void) {
@@ -367,11 +534,11 @@ static void test_cited_normalize_space_before_close_bracket(void) {
 }
 
 static void test_cited_normalize_closing_variants(void) {
-   char s[128] = "a< cited >M1< / cited >b";
+   char s[128] = "a< cited >M1< / cited >";
    text_filter_cited_normalize(s);
-   TEST_ASSERT_EQUAL_STRING("a<cited>M1</cited>b", s);
+   TEST_ASSERT_EQUAL_STRING("a<cited>M1</cited>", s);
    text_filter_cited_strip(s);
-   TEST_ASSERT_EQUAL_STRING("ab", s);
+   TEST_ASSERT_EQUAL_STRING("a", s);
 }
 
 static void test_cited_normalize_wellformed_unchanged(void) {
@@ -391,30 +558,34 @@ static void test_cited_normalize_null_safe(void) {
    text_filter_cited_normalize(NULL); /* must not crash */
 }
 
-/* ── whole-string command strip (text_filter_command_strip) ──────────────── */
+/* ── end-of-turn cut (text_filter_end_of_turn_strip) ───────────────────── */
 
-static void test_command_strip_pair_and_eot(void) {
-   char s[128] = "hi <command>{\"a\":1}</command> there<end_of_turn>trailing";
-   text_filter_command_strip(s, true);
-   TEST_ASSERT_EQUAL_STRING("hi  there", s);
+static void test_end_of_turn_strip_truncates(void) {
+   char s[128] = "hi there<end_of_turn>trailing";
+   text_filter_end_of_turn_strip(s);
+   TEST_ASSERT_EQUAL_STRING("hi there", s);
 }
 
-static void test_command_strip_orphan_truncates_when_true(void) {
-   /* Per-sentence TTS intent: drop a mid-split opener. */
-   char s[128] = "oops <command>{\"a\":1} no close";
-   text_filter_command_strip(s, true);
-   TEST_ASSERT_EQUAL_STRING("oops ", s);
+static void test_end_of_turn_strip_no_marker_unchanged(void) {
+   char s[128] = "hi there";
+   text_filter_end_of_turn_strip(s);
+   TEST_ASSERT_EQUAL_STRING("hi there", s);
 }
 
-static void test_command_strip_orphan_left_when_false(void) {
-   /* Complete-response intent: an unclosed <command> is left as literal text. */
-   char s[128] = "oops <command>{\"a\":1} no close";
-   text_filter_command_strip(s, false);
-   TEST_ASSERT_EQUAL_STRING("oops <command>{\"a\":1} no close", s);
+static void test_end_of_turn_strip_null_safe(void) {
+   text_filter_end_of_turn_strip(NULL); /* must not crash */
 }
 
-static void test_command_strip_null_safe(void) {
-   text_filter_command_strip(NULL, true); /* must not crash */
+static void test_end_of_turn_strip_at_start_empties(void) {
+   char s[128] = "<end_of_turn>trailing";
+   text_filter_end_of_turn_strip(s);
+   TEST_ASSERT_EQUAL_STRING("", s);
+}
+
+static void test_end_of_turn_strip_partial_tag_kept(void) {
+   char s[128] = "hi there<end_of";
+   text_filter_end_of_turn_strip(s);
+   TEST_ASSERT_EQUAL_STRING("hi there<end_of", s);
 }
 
 /* ── text_filter_emote_strip ────────────────────────────────────────────── */
@@ -496,22 +667,150 @@ static void test_emote_strip_null_and_no_name_out(void) {
 
 /* ── main ───────────────────────────────────────────────────────────────── */
 
+/* ── text_split_pieces ──────────────────────────────────────────────────── */
+
+/* Append @p add to the NUL-terminated @p dst of @p size bytes, cut to fit. */
+static void append(char *dst, size_t size, const char *add) {
+   size_t have = strlen(dst);
+   size_t n = strlen(add);
+   if (n > size - have - 1) {
+      n = size - have - 1;
+   }
+   memcpy(dst + have, add, n);
+   dst[have + n] = '\0';
+}
+
+typedef struct {
+   char out[2048];
+   size_t max_seen;
+   int calls;
+   int broken; /* pieces that start or end inside a character */
+   const char *first_ptr;
+} pieces_t;
+
+/* True when @p s starts on a character and ends with a complete one. */
+static bool whole_characters(const char *s) {
+   const unsigned char *p = (const unsigned char *)s;
+   while (*p) {
+      int len;
+      if (*p < 0x80) {
+         len = 1;
+      } else if ((*p & 0xE0) == 0xC0) {
+         len = 2;
+      } else if ((*p & 0xF0) == 0xE0) {
+         len = 3;
+      } else if ((*p & 0xF8) == 0xF0) {
+         len = 4;
+      } else {
+         return false; /* a continuation byte (0x80..0xBF) where a character starts */
+      }
+      for (int i = 1; i < len; i++) {
+         if ((p[i] & 0xC0) != 0x80) {
+            return false; /* the character is cut short */
+         }
+      }
+      p += len;
+   }
+   return true;
+}
+
+static void collect_piece(const char *piece, void *ctx) {
+   pieces_t *p = (pieces_t *)ctx;
+   size_t n = strlen(piece);
+   if (!whole_characters(piece)) {
+      p->broken++;
+   }
+   if (n > p->max_seen) {
+      p->max_seen = n;
+   }
+   if (p->calls++ == 0) {
+      p->first_ptr = piece;
+   }
+   append(p->out, sizeof(p->out), piece);
+}
+
+static void test_split_pieces_short_passes_through(void) {
+   pieces_t p = { 0 };
+   const char *text = "Hello world";
+   text_split_pieces(text, 64, collect_piece, &p);
+   TEST_ASSERT_EQUAL_INT(1, p.calls);
+   TEST_ASSERT_EQUAL_PTR(text, p.first_ptr);
+   TEST_ASSERT_EQUAL_STRING(text, p.out);
+
+   pieces_t none = { 0 };
+   text_split_pieces("", 64, collect_piece, &none);
+   text_split_pieces(NULL, 64, collect_piece, &none);
+   TEST_ASSERT_EQUAL_INT(0, none.calls);
+}
+
+/* Each piece ends on a character: "é" (2 bytes) and "€" (3 bytes) cross every
+ * cut point of a 7-byte limit somewhere in the run. */
+static void test_split_pieces_never_splits_a_character(void) {
+   char text[512] = "";
+   for (int i = 0; i < 40; i++) {
+      strcat(text, "a\xc3\xa9\xe2\x82\xac"); /* aé€ */
+   }
+   pieces_t p = { 0 };
+   text_split_pieces(text, 7, collect_piece, &p);
+   TEST_ASSERT_EQUAL_STRING(text, p.out);
+   TEST_ASSERT_TRUE(p.max_seen <= 7);
+   TEST_ASSERT_TRUE(p.calls > 1);
+   TEST_ASSERT_EQUAL_INT(0, p.broken);
+}
+
+/* A stream delta's filter buffer and piece (webui_send_stream_delta): one
+ * filtered piece is one frame. */
+#define FILTER_BUF WEBUI_STREAM_TEXT_SIZE
+#define PIECE_MAX (FILTER_BUF - CITED_TAG_BUF_SIZE)
+
+typedef struct {
+   char out[2048];
+   int calls;
+} filtered_t;
+
+static void filter_piece(const char *piece, void *ctx) {
+   filtered_t *f = (filtered_t *)ctx;
+   char filtered[FILTER_BUF];
+   text_filter_cited_tags_to_buffer(&s_cited, piece, filtered, sizeof(filtered));
+   append(f->out, sizeof(f->out), filtered);
+   f->calls++;
+}
+
+/* A chunk longer than the filter buffer, a tag across the piece boundary:
+ * filtered piece by piece (as a stream delta is) nothing is lost and the tag
+ * is still removed, where filtering it whole into the buffer cuts it short. */
+static void test_split_pieces_chunk_longer_than_filter_buffer(void) {
+   static const char tag[] = "<cited>M1,M7</cited>";
+   const size_t before = 2 * PIECE_MAX - 4; /* "<cit" ends the second piece */
+   char text[2048] = "";
+   char expected[2048] = "";
+   size_t n = 0;
+   while (n < before) {
+      /* "é" (2 bytes) along the way, ASCII where only one byte is left */
+      const char *add = (n % 10 == 8 && before - n >= 2) ? "\xc3\xa9" : "x";
+      strcat(text, add);
+      n += strlen(add);
+   }
+   strcat(expected, text); /* longer than the buffer: filtered whole, it is cut */
+   strcat(text, tag);      /* the reply's trailing tag */
+   TEST_ASSERT_EQUAL_INT(0, strncmp(text + before, tag, sizeof(tag) - 1));
+   TEST_ASSERT_TRUE(before < 2 * PIECE_MAX && 2 * PIECE_MAX < before + sizeof(tag) - 1);
+
+   char whole[FILTER_BUF];
+   text_filter_cited_tags_to_buffer(&s_cited, text, whole, sizeof(whole));
+   TEST_ASSERT_TRUE(strlen(whole) < strlen(expected));
+
+   text_filter_cited_reset(&s_cited);
+   filtered_t f = { 0 };
+   text_split_pieces(text, PIECE_MAX, filter_piece, &f);
+   cited_flush(f.out, sizeof(f.out)); /* the message's end decides the held tag */
+   TEST_ASSERT_EQUAL_INT(3, f.calls);
+   TEST_ASSERT_EQUAL_STRING(expected, f.out);
+   TEST_ASSERT_NULL(strstr(f.out, "M1"));
+}
+
 int main(void) {
    UNITY_BEGIN();
-   RUN_TEST(test_no_tags);
-   RUN_TEST(test_simple_tag_removal);
-   RUN_TEST(test_tag_at_start);
-   RUN_TEST(test_tag_at_end);
-   RUN_TEST(test_only_tag_content);
-   RUN_TEST(test_nested_tags);
-   RUN_TEST(test_multiple_tags);
-   RUN_TEST(test_streaming_across_chunks);
-   RUN_TEST(test_partial_tag_not_matching);
-   RUN_TEST(test_empty_input);
-   RUN_TEST(test_buffer_overflow_protection);
-   RUN_TEST(test_reset_mid_tag);
-   RUN_TEST(test_callback_receives_chunks);
-   RUN_TEST(test_deeply_nested);
    RUN_TEST(test_cited_no_tag);
    RUN_TEST(test_cited_whole_tag_one_delta);
    RUN_TEST(test_cited_split_opener_across_deltas);
@@ -523,12 +822,27 @@ int main(void) {
    RUN_TEST(test_cited_reset_between_turns);
    RUN_TEST(test_cited_double_open_bracket);
    RUN_TEST(test_cited_double_open_bracket_split);
-   RUN_TEST(test_cited_stray_bracket_in_closer);
+   RUN_TEST(test_cited_non_tag_content_is_text);
    RUN_TEST(test_cited_near_full_false_opener);
-   RUN_TEST(test_cited_two_blocks_one_stream);
-   RUN_TEST(test_command_double_open_bracket);
+   RUN_TEST(test_cited_two_trailing_tags_one_stream);
+   RUN_TEST(test_cited_mention_in_prose_is_kept);
+   RUN_TEST(test_cited_grammar_content_then_prose_is_kept);
+   RUN_TEST(test_cited_wellformed_tags_removed);
+   RUN_TEST(test_cited_tag_then_more_text_is_kept);
+   RUN_TEST(test_cited_trailing_tags_removed);
+   RUN_TEST(test_cited_trailing_whitespace_bound);
+   RUN_TEST(test_cited_flush_ends_each_message);
+   RUN_TEST(test_cited_examples_mid_reply_kept);
+   RUN_TEST(test_cited_truncated_partial_tag_dropped);
+   RUN_TEST(test_cited_run_at_and_past_the_hold);
+   RUN_TEST(test_cited_long_tag_of_ids_removed);
+   RUN_TEST(test_cited_bracketed_handles_removed);
+   RUN_TEST(test_cited_padded_closer_removed);
+   RUN_TEST(test_cited_strip_and_stream_agree);
+   RUN_TEST(test_cited_flush_held_bytes);
+   RUN_TEST(test_cited_find_reports_spans);
    RUN_TEST(test_cited_strip_trailing_tag);
-   RUN_TEST(test_cited_strip_multiple_tags);
+   RUN_TEST(test_cited_strip_tags_mid_text_kept);
    RUN_TEST(test_cited_strip_orphan_opener_truncates);
    RUN_TEST(test_cited_strip_no_tag_unchanged);
    RUN_TEST(test_cited_strip_null_safe);
@@ -538,10 +852,11 @@ int main(void) {
    RUN_TEST(test_cited_normalize_wellformed_unchanged);
    RUN_TEST(test_cited_normalize_non_tag_untouched);
    RUN_TEST(test_cited_normalize_null_safe);
-   RUN_TEST(test_command_strip_pair_and_eot);
-   RUN_TEST(test_command_strip_orphan_truncates_when_true);
-   RUN_TEST(test_command_strip_orphan_left_when_false);
-   RUN_TEST(test_command_strip_null_safe);
+   RUN_TEST(test_end_of_turn_strip_truncates);
+   RUN_TEST(test_end_of_turn_strip_no_marker_unchanged);
+   RUN_TEST(test_end_of_turn_strip_null_safe);
+   RUN_TEST(test_end_of_turn_strip_at_start_empties);
+   RUN_TEST(test_end_of_turn_strip_partial_tag_kept);
    RUN_TEST(test_emote_strip_leading_tag);
    RUN_TEST(test_emote_strip_spaced_and_cased);
    RUN_TEST(test_emote_strip_first_known_name_wins);
@@ -554,5 +869,8 @@ int main(void) {
    RUN_TEST(test_emote_strip_utf8_neighbours_untouched);
    RUN_TEST(test_emote_strip_mid_text_keeps_words_apart);
    RUN_TEST(test_emote_strip_null_and_no_name_out);
+   RUN_TEST(test_split_pieces_short_passes_through);
+   RUN_TEST(test_split_pieces_never_splits_a_character);
+   RUN_TEST(test_split_pieces_chunk_longer_than_filter_buffer);
    return UNITY_END();
 }

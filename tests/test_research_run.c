@@ -327,6 +327,36 @@ static void test_digest_respects_cap(void) {
    TEST_ASSERT_NOT_NULL(strstr(digest, "brief")); /* rendered content before truncating */
 }
 
+/* ── digest stays well-formed: a claim cut inside a character is repaired ────── */
+
+static void test_digest_repairs_a_cut_character(void) {
+   /* 239 ASCII bytes, then an em dash: the digest shows 240 bytes of a claim, so
+    * the cut lands after the dash's first byte. */
+   char claim[300];
+   memset(claim, 'a', 239);
+   snprintf(claim + 239, sizeof(claim) - 239, "\xE2\x80\x94 and more");
+   int64_t q1 = 0;
+   TEST_ASSERT_EQUAL_INT(AUTH_DB_SUCCESS, research_db_question_add(run, "a question?", 0, &q1));
+   TEST_ASSERT_EQUAL_INT(AUTH_DB_SUCCESS,
+                         research_db_claim_add(run, q1, claim, "http://a", "web", NULL, 0));
+
+   research_budgets_t b;
+   research_budgets_defaults(&b);
+   char digest[8192];
+   TEST_ASSERT_EQUAL_INT(AUTH_DB_SUCCESS,
+                         research_render_round_digest(run, "brief", &b, digest, sizeof(digest)));
+   char expect[300];
+   memset(expect, 'a', 239);
+   snprintf(expect + 239, sizeof(expect) - 239, "?\n");
+   TEST_ASSERT_NOT_NULL(strstr(digest, expect));
+
+   research_run_t cur = { 0 };
+   TEST_ASSERT_EQUAL_INT(AUTH_DB_SUCCESS,
+                         research_render_critic_digest(run, "brief", &b, &cur, "coverage", 1,
+                                                       digest, sizeof(digest)));
+   TEST_ASSERT_NOT_NULL(strstr(digest, expect));
+}
+
 /* ── report render: view over claims, grouped by question, with sources ──────── */
 
 static void test_render_report(void) {
@@ -368,6 +398,38 @@ static void canon_eq(const char *in, const char *expect) {
    char out[RESEARCH_URL_MAX];
    research_canonicalize_url(in, out, sizeof(out));
    TEST_ASSERT_EQUAL_STRING(expect, out);
+}
+
+/* A long label and a long take: the message carries both whole, and its
+ * closing line. */
+static void test_completion_message_is_never_cut(void) {
+   char label[RESEARCH_BRIEF_MAX];
+   memset(label, 'b', sizeof(label) - 1);
+   label[sizeof(label) - 1] = '\0';
+   char take[4096];
+   memset(take, 't', sizeof(take) - 1);
+   take[sizeof(take) - 1] = '\0';
+
+   char *msg = research_completion_message(label, take, 108, true);
+   TEST_ASSERT_NOT_NULL(msg);
+   TEST_ASSERT_NOT_NULL(strstr(msg, label));
+   TEST_ASSERT_NOT_NULL(strstr(msg, take));
+   const char *tail = "I gathered 108 findings; the full cited report is in your notes.";
+   TEST_ASSERT_TRUE(strlen(msg) > strlen(tail));
+   TEST_ASSERT_EQUAL_STRING(tail, msg + strlen(msg) - strlen(tail));
+   free(msg);
+
+   /* No take, and no saved report: the forms that say so. */
+   msg = research_completion_message("a question", NULL, 1, true);
+   TEST_ASSERT_NOT_NULL(strstr(msg, "I gathered 1 finding and saved a cited report"));
+   free(msg);
+   msg = research_completion_message("a question", "a take", 2, false);
+   TEST_ASSERT_NOT_NULL(strstr(msg, "couldn't save the report"));
+   TEST_ASSERT_NULL(strstr(msg, "a take"));
+   free(msg);
+   msg = research_completion_message("a question", "a take", 0, false);
+   TEST_ASSERT_NOT_NULL(strstr(msg, "couldn't find enough to report"));
+   free(msg);
 }
 
 static void test_canonicalize_url(void) {
@@ -427,7 +489,9 @@ int main(void) {
    RUN_TEST(test_should_stop_decision);
    RUN_TEST(test_digest_content);
    RUN_TEST(test_digest_respects_cap);
+   RUN_TEST(test_digest_repairs_a_cut_character);
    RUN_TEST(test_render_report);
    RUN_TEST(test_render_report_empty);
+   RUN_TEST(test_completion_message_is_never_cut);
    return UNITY_END();
 }

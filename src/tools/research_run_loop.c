@@ -41,7 +41,9 @@
 #include "auth/auth_db.h"
 #include "config/dawn_config.h"
 #include "core/conv_event.h"
+#include "core/conv_turn_lease.h"
 #include "core/event_payload.h"
+#include "core/job_report.h"
 #include "core/memory_filter.h" /* memory_filter_check_injection_commands (critic gap gate) */
 #include "core/outside_kind.h"
 #include "core/session_manager.h"
@@ -49,9 +51,11 @@
 #include "core/user_tz.h"
 #include "llm/llm_cache_monitor.h"
 #include "llm/llm_command_parser.h"
+#include "llm/llm_tools.h" /* LLM_TOOLS_MAX_ITERATIONS */
 #include "logging.h"
 #include "memory/memory_note_bridge.h"
 #include "prompts.h"
+#include "tools/document_db.h"
 #include "tools/document_index_pipeline.h"
 #include "tools/research_run.h"
 #include "utils/string_utils.h" /* sanitize_utf8_for_json */
@@ -200,6 +204,8 @@ static void research_persist_report_note(int user_id,
       rc = document_index_text(user_id, label, "text", report, strlen(report), false, NULL, &res);
       if (rc == DOC_INDEX_SUCCESS && res.doc_id > 0) {
          research_db_run_set_report_doc(run_id, res.doc_id);
+         (void)document_db_set_outside(user_id, res.doc_id, OUTSIDE_RESEARCH, false,
+                                       OUTSIDE_RESEARCH);
          OLOG_INFO("research: run %lld report saved as document %lld (%s)", (long long)run_id,
                    (long long)res.doc_id, label);
       } else if (rc == DOC_INDEX_ERROR_DUPLICATE && res.doc_id > 0) {
@@ -221,6 +227,7 @@ static void research_persist_report_note(int user_id,
       return;
    }
    research_db_run_set_report_doc(run_id, res.doc_id);
+   (void)document_db_set_outside(user_id, res.doc_id, OUTSIDE_RESEARCH, false, OUTSIDE_RESEARCH);
    /* Best-effort memory->note bridge, exactly like do_save_note; never from a
     * private conversation's run (the job inherits its privacy): the gloss is a
     * memory, and nothing private is learned.  Unreadable counts as private. */
@@ -387,14 +394,33 @@ static char *research_assemble_report(const char *prose, const char *evidence, c
    return NULL;
 }
 
+/* A cancelled or reaped run stops waiting for its conversation. */
+static bool research_report_wait_should_stop(void *ctx) {
+   const session_t *s = ctx;
+   return atomic_load(&s->cancel_requested);
+}
+
 /* Persist the finished report to the job's OWN conversation as an assistant message
  * so the WebUI job viewer shows the answer instead of a blank transcript (the
- * research worker otherwise writes no messages there).  Best-effort. */
-static void research_persist_report_to_job_conv(const research_run_t *run0, const char *body) {
+ * research worker otherwise writes no messages there).  Best-effort.  Written
+ * holding the conversation's lease, like any turn's rows (this worker thread
+ * may wait for it); without one (the run cancelled while it waited, shut down,
+ * table full) it is written anyway. */
+static void research_persist_report_to_job_conv(const session_t *s,
+                                                const research_run_t *run0,
+                                                const char *body) {
+   const uint64_t token = conv_turn_lease_new_token();
+   const bool leased = conv_turn_lease_acquire(run0->conversation_id, s->session_id, token,
+                                               research_report_wait_should_stop,
+                                               (void *)s) == CONV_TURN_LEASE_GRANTED;
    int64_t msg_id = 0;
    /* no-blocks: the report DAWN compiled from its evidence ledger. */
-   if (conv_db_add_message_with_tools(run0->conversation_id, run0->user_id, "assistant", body, NULL,
-                                      NULL, NULL, &msg_id) != AUTH_DB_SUCCESS) {
+   const int rc = conv_db_add_message_with_tools(run0->conversation_id, run0->user_id, "assistant",
+                                                 body, NULL, NULL, NULL, &msg_id);
+   if (leased) {
+      (void)conv_turn_lease_release(run0->conversation_id, token);
+   }
+   if (rc != AUTH_DB_SUCCESS) {
       OLOG_WARNING("research: failed to persist report to job conv %lld",
                    (long long)run0->conversation_id);
       return;
@@ -514,11 +540,7 @@ static char *research_commentary_context(const research_run_t *run0) {
  * (caller frees) or NULL on failure — caller falls back to the mechanical excerpt. */
 static char *research_commentary(struct session *s, const research_run_t *run0, const char *prose) {
    char persona[LLM_PERSONA_MAX];
-   llm_persona_effective(persona, sizeof(persona));
-   size_t plen = strlen(persona);
-   while (plen > 0 && (persona[plen - 1] == '\n' || persona[plen - 1] == ' ')) {
-      persona[--plen] = '\0'; /* the template supplies the blank line after it */
-   }
+   job_report_persona(persona, sizeof(persona));
    char *convo = research_commentary_context(run0);
 
    size_t sys_need = strlen(persona) + sizeof(RESEARCH_COMMENTARY_PROMPT_TEMPLATE);
@@ -544,24 +566,11 @@ static char *research_commentary(struct session *s, const research_run_t *run0, 
        run0->brief, prose);
    free(convo);
 
-   session_init_system_prompt(s, sysprompt); /* persona + report-back instructions */
-   session_set_tools_suppressed(s, true);    /* a take needs no tools */
-   text_input_dispatch_opts_t opts = {
-      .conversation_id = 0,
-      .auth_user_id = run0->user_id,
-      .skip_prompt_rebuild = true,
-   };
-   /* A side call on the run's session: recorded, but it doesn't touch the
-    * rounds' cache key or context numbers. */
-   const int kind_prev = llm_cache_monitor_push_kind(LLM_CALL_SYNTHESIS);
-   char *take = core_text_input_dispatch(s, directive, &opts);
-   llm_cache_monitor_pop_kind(kind_prev);
-   session_set_tools_suppressed(s, false);
+   /* A side call on the run's session (no tools): it doesn't touch the rounds'
+    * cache key or context numbers. */
+   char *take = job_report_take(s, sysprompt, directive, run0->user_id);
    free(directive);
    free(sysprompt);
-   if (take != NULL) {
-      sanitize_utf8_for_json(take); /* becomes the chat completion body */
-   }
    return take;
 }
 
@@ -583,7 +592,7 @@ const char *research_run_execute(struct session *s,
     * round_digest_max_chars is not silently clipped by a fixed stack buffer. */
    size_t dir_size = (b->round_digest_max_chars > 0 ? (size_t)b->round_digest_max_chars
                                                     : RESEARCH_DEFAULT_ROUND_DIGEST_MAX_CHARS) +
-                     256;
+                     512; /* room past the digest for the step-budget line */
    char *directive = malloc(dir_size);
    if (!directive) {
       return RESEARCH_STOP_FAILED;
@@ -633,13 +642,21 @@ const char *research_run_execute(struct session *s,
       session_set_research_context(s, run_id, round);
 
       research_render_round_digest(run_id, run0->brief, b, directive, dir_size);
+      const size_t dir_len = strlen(directive);
+      snprintf(directive + dir_len, dir_size - dir_len, RESEARCH_ROUND_STEP_BUDGET_TEMPLATE,
+               LLM_TOOLS_MAX_ITERATIONS);
 
       text_input_dispatch_opts_t opts = {
          .conversation_id = 0, /* rounds live in the ledger, not messages (§4a) */
          .auth_user_id = run0->user_id,
          .skip_prompt_rebuild = true, /* keep the per-turn builder (memory) OUT of the loop */
       };
+      /* A round has no reader for an answer: its last step saves what the step
+       * before it found.  Set for the round's dispatch alone; the critic,
+       * synthesis and completion take end as answers. */
+      session_set_turn_save_note(s, RESEARCH_ROUND_LAST_STEP_NOTE);
       char *resp = core_text_input_dispatch(s, directive, &opts);
+      session_set_turn_save_note(s, NULL);
       const bool round_failed = (resp == NULL);
       free(resp);
 
@@ -903,7 +920,7 @@ const char *research_run_execute(struct session *s,
          /* Job-conversation copy so the WebUI viewer shows the answer, not a blank
           * transcript.  With prose, the chat bubble carries just the answer (the full
           * evidence lives in the note); otherwise the whole report. */
-         research_persist_report_to_job_conv(run0, (prose && prose[0]) ? prose : report);
+         research_persist_report_to_job_conv(s, run0, (prose && prose[0]) ? prose : report);
       }
       free(report);
    } else {

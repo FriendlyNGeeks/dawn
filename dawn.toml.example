@@ -192,8 +192,22 @@
 # type = "cloud"                  # "cloud" or "local"
                                   # Env: DAWN_LLM_TYPE
 # max_tokens = 16384              # Maximum response tokens (ceiling, not a target). 16384 is the
-                                  # universally-safe max (= GPT-4o's cap); Claude 4.x allows up to 64K.
+                                  # universally-safe max (= GPT-4o's cap). A streamed reply that
+                                  # reasons (Claude, OpenAI, Gemini) gets at least its
+                                  # effort's ceiling instead (low 16K, medium 32K, high 64K,
+                                  # xhigh/max 128K), held under the model's max_output in
+                                  # models.toml: reasoning counts toward it. A cloud reply's
+                                  # ceiling is also held to the room left in the model's window.
                                   # Env: DAWN_LLM_MAX_TOKENS
+# local_fallback = false          # true: when the cloud provider can't be reached (or keeps
+                                  # failing with 429/5xx), an interactive turn (voice, chat,
+                                  # satellite, message; not background jobs) is
+                                  # answered by [llm.local] instead, and the first such reply says
+                                  # so; the cloud is tried again after a minute, then less often
+                                  # (up to 10 min) while it stays down. Only for a local LLM you run.
+                                  # An http:// endpoint on another machine carries the whole
+                                  # conversation unencrypted, and anyone who can cut this machine's
+                                  # internet can make DAWN use it: prefer https or 127.0.0.1.
 # compact_soft_threshold = 0.60   # Async background compaction trigger
 # compact_hard_threshold = 0.85   # Blocking compaction trigger (safety net)
 # compact_use_session = true      # Use session's LLM for compaction. Set false to compact with a
@@ -210,9 +224,13 @@
                                   # Env: DAWN_LLM_RATE_LIMIT_RPM
 
 [llm.cloud]
-# provider = "openai"             # "openai", "claude", "gemini", or "openrouter"
+# provider = ""                   # "openai", "claude", "gemini", or "openrouter": the one whose
+                                  # key is used.  Empty = not selected: the local LLM answers,
+                                  # whatever keys secrets.toml holds (a key never selects one).
                                   # Env: DAWN_LLM_CLOUD_PROVIDER
-# endpoint = ""                   # Custom endpoint (empty = default provider URL)
+# endpoint = ""                   # Custom endpoint for the provider above (empty = its default
+                                  # URL). Only that provider uses it: a conversation on another
+                                  # provider keeps its own URL, so no key goes to the wrong host.
                                   # Env: DAWN_LLM_CLOUD_ENDPOINT
 # vision_enabled = true           # Cloud models typically support vision/images
                                   # Env: DAWN_LLM_CLOUD_VISION_ENABLED
@@ -238,15 +256,15 @@
 
 # Model lists for quick switching via WebUI or voice
 # First model in list is used when switching to that provider (up to 32 models per provider)
-# openai_models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4-mini", "gpt-5.4-nano"]
+# openai_models = ["gpt-6-luna", "gpt-6.1-terra", "gpt-6.2-sol", "gpt-6.2-astra"]
 # openai_default_model_idx = 0
-# claude_models = ["claude-haiku-5-5", "claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5"]
+# claude_models = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"]
 # claude_default_model_idx = 0
-# gemini_models = ["gemini-3.7-flash", "gemini-3.1-pro-preview"]
+# gemini_models = ["gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon"]
 # gemini_default_model_idx = 0
 # OpenRouter favorites (used when provider = "openrouter"). IDs are "vendor/model".
 # These are the curated shortlist shown in the header model switcher.
-# openrouter_models = ["anthropic/claude-haiku-5.5", "anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5", "openai/gpt-5.6-luna", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.5", "openai/gpt-5.4-mini", "openai/gpt-5.4-nano", "google/gemini-3.7-flash", "google/gemini-3.1-pro-preview"]
+# openrouter_models = ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5", "anthropic/claude-fable-5.2", "openai/gpt-6-luna", "openai/gpt-6.1-terra", "openai/gpt-6.2-sol", "openai/gpt-6.2-astra", "google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-4-argon"]
 # openrouter_default_model_idx = 0   # anthropic/claude-haiku-5.5
                                   # Verify slugs against https://openrouter.ai/models
 
@@ -1227,9 +1245,21 @@ citation_reinforcement_boost = 0.05
 # stale_after_sec = 30               # Live reads older than this report "stale"
 
 # =============================================================================
+# Coding agent (coding_agent tool) — hands coding work to the agent gateway
+# ([[mcp.server]] role = "agent_gateway", below) and replies on its pull
+# requests' review threads on the user's yes.
+# =============================================================================
+[coding_agent]
+# sign_replies = true                # End each reply posted on GitHub "— <ai_name>"
+
+# =============================================================================
 # MCP Bridge (coding harness) — requires building with
 # -DDAWN_ENABLE_MCP_BRIDGE_TOOL=ON. DAWN is a pure MCP *client*; the operator
-# launches each MCP server (systemd/tmux/docker). Transport is HTTP+SSE only.
+# launches each MCP server (systemd/tmux/docker). Transports: "http+sse" (an SSE
+# stream, e.g. through mcp-proxy) or "http" (stateless: one POST per message,
+# JSON replies; a server that streams its replies or needs sessions uses
+# "http+sse"). With "http", request_timeout_seconds bounds each whole POST,
+# long-polls included.
 # =============================================================================
 # [mcp]
 # enabled = false                    # master switch for the bridge
@@ -1241,11 +1271,23 @@ citation_reinforcement_boost = 0.05
 # transport = "http+sse"
 # enabled = true
 # capabilities = "read_only"         # "dangerous" (default) or "read_only"
+#
+# [[mcp.server]]                     # a stateless server, e.g. the coding agents' gateway
+# alias = "agents"
+# url = "http://127.0.0.1:9760/mcp"
+# transport = "http"
+# request_timeout_seconds = 60
+# role = "agent_gateway"             # services/agent-gateway: Friday hands it coding tasks.
+#                                    # Only a server declared so gets them; none of its
+#                                    # tools are offered to the model.
+# (a bearer token is sent to another host only over https with tls_verify)
+#
+# Settings for either kind:
 # request_timeout_seconds = 30
 # idle_close_seconds = 600
 # tls_verify = true                  # false requires [mcp] dev_mode = true
-# auth_bearer_env = "CBM_TOKEN"      # env var holding the bearer token (Phase 1 source)
-# # auth_bearer_token_secret = "cbm_token"  # reserved: secrets.toml named-key (not yet wired)
+# auth_bearer_env = "CBM_TOKEN"      # an env var holding the token; when it has no value:
+# auth_bearer_token_secret = "agents"  # the token in secrets.toml [secrets.mcp], by this name
 
 # =============================================================================
 # Code Projects (coding harness) — [code_projects]

@@ -38,9 +38,11 @@
 #include "core/ota_db.h"
 #include "core/rate_limiter.h"
 #include "core/session_manager.h"
+#include "core/session_prefix.h"
 #include "core/turn_queue.h"
 #include "core/utterance_dedup.h"
 #include "llm/llm_command_parser.h"
+#include "llm/llm_selection.h"
 #include "logging.h"
 #include "tools/volume_tool.h"
 #include "utils/string_utils.h"
@@ -133,10 +135,6 @@ void satellite_send_stream_start(session_t *session) {
 
    uint32_t sid = atomic_fetch_add(&session->current_stream_id, 1) + 1;
    atomic_store(&session->llm_streaming_active, true);
-
-   /* Reset command tag filter state for new stream */
-   session->cmd_tag_filter.nesting_depth = 0;
-   session->cmd_tag_filter.len = 0;
 
    ws_response_t resp = { .session = session,
                           .type = WS_RESP_STREAM_START,
@@ -289,6 +287,21 @@ static void *satellite_worker_thread(void *arg) {
    session_turn_begin(session, 0, (int)session->metrics.user_id);
    turn_begun = true;
 
+   /* An LLM that can't run refuses the query before it's added: the reason is
+    * the reply (spoken by the satellite, or by the server for one without TTS). */
+   bool needs_server_tts = !session_capabilities(session).local_tts;
+   char refusal[LLM_SELECTION_REASON_MAX];
+   if (session_turn_selection_problem(session, refusal, sizeof(refusal)) != 0) {
+      OLOG_WARNING("Satellite: query from %s refused: %s", session->identity.name, refusal);
+      if (needs_server_tts) {
+         webui_sentence_audio_callback(refusal, session);
+      }
+      satellite_send_response(session, refusal);
+      terminal_sent = true;
+      satellite_send_state(session, "idle");
+      goto cleanup;
+   }
+
    /* Add user message to history */
    session_add_turn_message(session, "user", text);
 
@@ -300,11 +313,17 @@ static void *satellite_worker_thread(void *arg) {
    /* Call LLM with TTS callback for Tier 2 satellites (server-side TTS).
     * Tier 1 satellites have local TTS and only need the text response, but
     * Tier 2 devices need the daemon to synthesize speech and send PCM audio. */
-   bool needs_server_tts = !session_capabilities(session).local_tts;
    response = session_llm_call_with_tts_no_add(session, text,
                                                needs_server_tts ? webui_sentence_audio_callback
                                                                 : NULL,
                                                needs_server_tts ? session : NULL);
+
+   /* No reply (failed, empty, stopped or superseded): the tool changes no
+    * model answered go back.  A superseding query waits in the turn queue
+    * until this turn ends, so they're this turn's. */
+   if (!response || !response[0]) {
+      (void)session_prefix_take_back_changes(session);
+   }
 
    /* Check if request was superseded during LLM call.  A superseding query has
     * already spawned a successor worker that will emit the terminal frame, so

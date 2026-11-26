@@ -4,7 +4,7 @@
 
 This document is the **architectural map**: directory layout, the cross-cutting rules every subsystem obeys (layering, threading, lock ordering, error handling, configuration), and a one-paragraph summary of each subsystem with a link to its detail doc. For the internals of any single subsystem — its components, data flow, DB schema, and tuning — open the linked file in [`docs/arch/subsystems/`](docs/arch/subsystems/).
 
-**Last updated**: October 2026.
+**Last updated**: November 2026.
 
 ## Table of Contents
 
@@ -124,7 +124,7 @@ Each row points to a detail doc in [`docs/arch/subsystems/`](docs/arch/subsystem
 
 | Subsystem | Role | Detail doc |
 |---|---|---|
-| **Core** (`src/` root + `src/core/`) | Main entry, MQTT integration, legacy command parsing. `src/dawn.c` hosts the state machine; `src/mosquitto_comms.c/h` wires MQTT; `src/text_to_command_nuevo.c/h` extracts `<command>` tags from LLM output; `src/word_to_number.c/h` converts "twenty-three" → 23; `src/core/` contains the session manager, scheduler, command executor/router, worker pool, and wake-word detector. Logging macros (`OLOG_INFO/WARNING/ERROR/DEBUG`) come from `common/include/logging.h`, shared with the satellite. | *(inlined above)* |
+| **Core** (`src/` root + `src/core/`) | Main entry, MQTT integration, direct command matching. `src/dawn.c` hosts the state machine; `src/mosquitto_comms.c/h` wires MQTT; `src/text_to_command_nuevo.c/h` matches a spoken command against the tools' patterns; `src/word_to_number.c/h` converts "twenty-three" → 23; `src/core/` contains the session manager, scheduler, command executor/router, worker pool, and wake-word detector. Logging macros (`OLOG_INFO/WARNING/ERROR/DEBUG`) come from `common/include/logging.h`, shared with the satellite. | *(inlined above)* |
 | **ASR** | Speech recognition abstraction (Strategy pattern) over Whisper and Vosk, plus Silero VAD and chunking for long utterances. Whisper on Jetson GPU is the default; Vosk is retained for CPU-only builds. | [asr.md](docs/arch/subsystems/asr.md) |
 | **LLM** | Unified interface for OpenAI, Claude, Gemini, **OpenRouter** (a first-class `provider` fronting many vendors through one key; its `anthropic/` models use its Anthropic Messages endpoint on the Claude path, the rest its OpenAI-compatible one), and local (llama.cpp/Ollama). Streaming via SSE feeds a sentence buffer that hands complete sentences to TTS while the response is still generating. A conversation's request is append-only (`src/core/session_prefix.c`): its system prompt and tool set are frozen on its first turn, and later changes (instructions, the surface's directions, each turn's context) are appended where they happen, so providers cache the whole conversation and signed reasoning stays replayable. Runs on a dedicated worker thread so the main audio loop never blocks; wake-word interrupts abort in-flight API calls. | [llm.md](docs/arch/subsystems/llm.md) |
 | **TTS** | Piper + ONNX Runtime with preprocessing for natural phrasing. Mutex-protected so the main loop, network server, and streaming buffer can all synthesize safely. | [tts.md](docs/arch/subsystems/tts.md) |
@@ -143,6 +143,7 @@ Each row points to a detail doc in [`docs/arch/subsystems/`](docs/arch/subsystem
 | **Phone & SMS** (`src/tools/phone_*.c`) | Cellular calls and SMS via the external **ECHO** modem daemon (SIM7600G-H) over MQTT. `phone_tool.c` is the LLM interface; `phone_service.c` runs the call state machine (RINGING/ANSWERING/ACTIVE, atomic first-wins answer claim) + TTS announcements + HUD/WebUI banner; `phone_db.c` logs calls/SMS. Incoming-call context is posted to every interactive session via `session_broadcast_notice()` (rendered into each turn's volatile prompt block for 10 minutes, never written into a conversation history); a WebUI incoming-call banner + persistent in-call panel let any surface answer/reject/hang up. Two-way call **audio** bridge (Phase 5) is not yet shipped. | [PHONE_SMS_DESIGN.md](docs/PHONE_SMS_DESIGN.md) |
 | **OAuth 2.0 & Crypto** | Shared OAuth client with PKCE S256 and `crypto_store.c` (libsodium `crypto_secretbox`) for encrypted token and password storage. Used by email and calendar. | [oauth-crypto.md](docs/arch/subsystems/oauth-crypto.md) |
 | **Robot body (Reachy Mini)** (`src/core/dawn_events.c`, `src/core/component_status.c`, `services/reachy-bridge/`) | Gives the local voice surface a body. DAWN publishes what the voice loop is doing on MQTT `dawn/events` (state, wake word, speaking start/end, and the expression the model chose with an inline `[emote:name]` tag, stripped before speech and storage). It never drives the robot: a separate Python bridge does, through Pollen's SDK. While the bridge reports `reachy/status` online, the local session's standing directions add the expression directive, and the session is told in a notice when the body goes or comes back. | [OASIS_COMMUNICATIONS_PROTOCOL.md](docs/OASIS_COMMUNICATIONS_PROTOCOL.md), [services/reachy-bridge/README.md](services/reachy-bridge/README.md) |
+| **Coding agents** (`services/agent-gateway/`) | Lets DAWN hand coding work to Claude Code without running it. A separate Python gateway (user `dawn`, MCP on 127.0.0.1 with a bearer token) runs each task as the less privileged `dawn-agent` user in Claude Code's bubblewrap sandbox, in its own clone of a gateway-owned mirror. The gateway never runs git in the agent's clone outside a jail; work comes back as a bundle, and publishing (push of `agent/*`, PR) happens from the mirror on the user's confirmation. Questions, hosts and tools the agent needs are requests the operator answers (per task, per repo or always); whether to ask is decided in code. Events are read by long-poll from any sequence number. In DAWN, the `coding_agent` tool starts and checks tasks (each a job of kind `coding`) and answers what they wait on (allowing a host or tool needs the user's yes to a preview DAWN renders), one watcher thread (`coding_agent_watch.c`) carries the gateway's events onto those jobs, and a job's end is reported back into the conversation it came from (`coding_agent_report.c`, with deep research's helpers in `core/job_report.c`); the tool and the watcher reach the gateway through `coding_agent_gateway.c`. A pull request on any repo the gateway's token reaches can be read too (its state and checks, its review threads, a failing check's log; `coding_agent_github.c`, framed as web content), and, on the user's yes to a preview DAWN renders, replied on (signed by default, its thread resolved) or put to Copilot for another review (`coding_agent_github_post.c`); a revise of a job whose pull request is open hands the agent that pull request's open feedback through a read-only tool of its own (`pr_feedback`), never in the instructions. Finished work is published (push of its branch and a pull request, on a preview DAWN renders and the user's yes) or closed (its clone and branch dropped; asked first when unpublished commits or uncommitted edits would be lost); the gateway closes a task itself once its pull request merges with everything published. In the WebUI, a coding job's view shows its steps and report, and a card on its jobs-panel row and in its view answers what it waits on with a click (`webui_coding.c`, `www/js/ui/coding-events.js`), checked by the server against the live request; the jobs panel lists the standing approvals with Revoke (`coding-grants.js`), and a changes viewer shows a job's files and diffs from the gateway's mirror, never through the model (`coding-viewer.js`); its Publish and Close buttons, where the click is the confirm on what DAWN shows, live in `coding-viewer-actions.js`, with the handlers in `webui_coding.c`. | [services/agent-gateway/README.md](services/agent-gateway/README.md) |
 | **Scheduler** | Timers, alarms, reminders, and scheduled tool execution. Background thread polls every second, fires with chime audio + WebUI banner notifications, supports recurrence and snooze/dismiss. | [scheduler.md](docs/arch/subsystems/scheduler.md) |
 | **Home Assistant** | REST API client with entity cache, fuzzy name matching, and satellite area-awareness (a satellite's Home Assistant area sent with its standing directions). 16 tool actions spanning lights, climate, locks, covers, media, scenes, scripts, automations. | [homeassistant.md](docs/arch/subsystems/homeassistant.md) |
 | **Per-User Settings** | Persona, location, timezone, units, theme — stored in `user_settings` and injected into the LLM system prompt at session start so every session is personalized to the authenticated user. | [user-settings.md](docs/arch/subsystems/user-settings.md) |
@@ -165,7 +166,7 @@ Layer 1 (Core infrastructure) — deps: Layer 0
 │                               device, prepare, act) and the frame its result goes in when it is someone
 │                               else's text, checked at registration and at build time
 ├── src/core/ primitives        Command routing/execution, worker pool, wake word, time parsing, utterance
-│                               dedup, reply codes, text-input dispatch, prompt sections, input queue
+│                               dedup, reply codes, prompt sections, input queue
 ├── src/core/dawn_events.c      The local voice surface's events on MQTT dawn/events, published from the voice
 │                               loop and the TTS thread (no DAWN lock is held across a publish)
 ├── src/core/tz.c               Clock times in a named zone (libical), never the process's TZ.  tz_lookup only
@@ -177,8 +178,12 @@ Layer 1 (Core infrastructure) — deps: Layer 0
 │                               a job's result, a device's data, an outside focus item); stored, so append only;
 │                               the live extraction scan and the SQL over stored rows match the same definitions
 ├── include/core/turn_origin.h  Where a pending action was made; a confirm carries it out only in the same
-│                               session, on the next turn, and never in a turn carrying an email the user
-│                               attached
+│                               session, in a later turn (the next one, or one of the next few where a
+│                               table allows it), never in a turn carrying an email the user attached,
+│                               and never for an action prepared in a turn the user stopped
+├── src/core/conv_turn_lease.c  One turn per conversation at a time: a turn takes its conversation's lease, waiting
+│                               FIFO behind the holder; a post from outside a turn never waits (written now, or
+│                               queued and written by the holder's release before the next turn starts)
 ├── src/core/pending_slots.c    What a tool staged for the user's confirm: one item per session and kind, each
 │                               with a new id its confirm must name; never evicts another session's item
 ├── src/core/tool_call_challenge.c  An action asked for by text, waiting for its reply code: one per channel,
@@ -191,11 +196,15 @@ Layer 2 (Services) — deps: Layers 0-1 and each other, acyclic
 │                               include it from Layer 2 up
 ├── src/llm/                    Providers, streaming, tool loop, turn blocks, compaction core, tool-result views;
 │                               llm_third_party.c frames an email's or a page's text as someone else's
-├── src/core/ services          Session unit (below), focus framework (src/core/focus/), prompt prefix
-│                               (prefix_*), embeddings, crypto store, scheduler, tool-result store, OTA, images
+├── src/core/ services          Session unit (below), text-input dispatch, focus framework (src/core/focus/),
+│                               prompt prefix (prefix_*), embeddings, crypto store, scheduler, tool-result
+│                               store, OTA, images
+├── src/core/conv_post.c        Every row written into a conversation from outside a turn (a job's report, a channel
+│                               message DAWN sent) goes through conv_post_unprompted(), through the lease
 ├── src/core/tool_call_policy.c Who may make a tool call: the caller's kind of turn (user, unverified sender,
 │                               background job, unattended, a user turn carrying an attached email) against the
-│                               action's kind; decided once per call
+│                               action's kind, narrowed to state calls on the last step of a turn that ends
+│                               on a save; decided once per call
 ├── src/memory/                 Persistent memory, contacts, extraction, forgetting
 ├── src/auth/                   Users, settings, conversations and messages; auth_db_messages.c is the one
 │                               message insert (and the LLM replay read)
@@ -223,8 +232,8 @@ Layer 4 (Application) — deps: everything below
 ├── src/webui/                  Web interface and WebSocket server.  Optional (ENABLE_WEBUI): without it,
 │                               webui_absent.c supplies the WebUI entry points the rest of DAWN calls, as
 │                               no-ops, and the WebUI-only pieces are left out (messaging channels, the job and
-│                               deep_research tools, the OAuth and code-project handlers, Home Assistant's
-│                               realtime connection)
+│                               deep_research tools, the coding_agent tool, the OAuth and code-project
+│                               handlers, Home Assistant's realtime connection)
 │   ├── webui_email_exec*.c     The WebUI's email executor: per-account tasks on 4 workers, the IMAP lease
 │   │                           taken by ticket so no worker waits on an account, replies by session id; a
 │   │                           session's moves queue in order on its MOVE slot, never replaced
@@ -241,8 +250,11 @@ Layer 4 (Application) — deps: everything below
 
 **The session unit.** `session_manager.c` (the dispatch), `session_history.c` (history lifecycle),
 `session_prefix.c` (the append-only request: frozen prefix, appended changes and turn context, live withdrawal),
-`session_compaction.c`, `session_focus.c`, `prompt_builder.c` and `session_image_hold.c` call into each other: read
-them as one Layer-2 unit, not as separate modules with a direction between them.
+`session_catchup.c` (a turn's history brought up to date with its conversation),
+`session_turn_lease.c` (a turn's wait for its conversation's lease, and what others may ask of the turn holding it),
+`session_compaction.c`, `session_focus.c`, `session_posts.c`, `prompt_builder.c`, `session_image_hold.c` and
+`session_stop.c` (the user's Stop: which turns the user stopped, and whether a turn's reply is one)
+call into each other: read them as one Layer-2 unit, not as separate modules with a direction between them.
 
 **Deliberate upward calls.** Each goes through a weak symbol or a registered function pointer, never an `#include`:
 
@@ -257,8 +269,18 @@ them as one Layer-2 unit, not as separate modules with a direction between them.
 | `src/tools/music_tool.c` (the player a session has of its own) | `webui_music.c` (a tab's or a Tier-1 satellite's player) | weak `music_player_for_session` |
 | `src/tools/volume_tool.c` (a session's own client) | `webui_music.c` (a tab's or a satellite's volume) | weak `volume_tool_for_session` |
 | lower-layer broadcasts (scheduler, jobs, calendar, phone, ...) | `webui_broadcasts.c` | weak no-op default, strong WebUI override |
+| `src/core/job_reinvoke.c`, `src/tools/coding_agent_watch.c` (the tab viewing a conversation: a job's follow-up, a coding job's approval) | `webui_broadcasts.c` | weak `webui_find_reinvoke_viewer` |
 | `src/tools/email_service_move.c` (a move or undo changed a mailbox) | `webui_email_changed.c` (email_changed to every tab of the user) | weak `email_changed_notify` |
 | `src/tools/email_account_lease.c` (a queued lease ticket was granted) | the WebUI email executor, which runs that task | `email_lease_set_hook` |
+| `src/memory/memory_consolidate.c`, `memory_consolidation_undo.c` (a batch recorded, undone or kept) | `webui_broadcasts.c` (`memory_batch` to every tab of the user) | weak `memory_consolidation_batch_notify` |
+| `src/core/job_manager.c` (cancel a job whose work runs outside DAWN) | `coding_agent_tool.c` (asks the agent gateway to stop a coding job's task) | `job_manager_register_kind_cancel` |
+| `src/core/job_worker.c`, `job_reinvoke.c` (a tool loop's per-iteration hook) | `webui_text_processing.c` (seals a viewer's streaming bubble at each tool boundary) | weak `webui_tool_iteration_cb` (a no-op in `webui_absent.c`) |
+| `src/llm/llm_tool_loop.c` (a model message before its tool calls has ended) | `webui_server.c` (resolves the stream's `<cited>` filter: a tag counts only at a message's end) | weak `webui_stream_message_end` |
+| `src/core/session_manager.c` (a session about to be freed) | `webui_send.c` (drops the queued WebUI responses that name it) | weak `webui_send_purge_session` |
+| `src/core/conv_post.c` (a post into a conversation) | the WebUI, which tells the tabs viewing it to refetch | `webui_broadcast_conversation_messages_appended` (strong in `webui_broadcasts.c`, a no-op in `webui_absent.c`) |
+| `src/core/conv_turn_lease.c` (a queued post written at the holder's release) | `conv_post.c`'s writer | `conv_turn_lease_set_writer`, at startup |
+| `src/core/session_turn_lease.c` (a turn waits for its conversation, gets it, or stops waiting) | the waiting session's client (`webui_turn_wait.c`) | weak `session_turn_waiting_notice` |
+| `src/core/session_catchup.c` (a turn brings its session's history up to date with its conversation) | the history loader and the tail loader (`memory_history_request_tail`), registered by the WebUI server | `session_set_history_loader`, `session_set_history_tail_loader`, at startup |
 
 \* **Orchestration-unit note.** `job_worker.c` and `research_worker.c` physically live in
 `src/core/` but are **application-orchestration units**: each is a detached top-of-stack sequencer
@@ -309,7 +331,9 @@ depends on, so every build runs them, and they fail the build when broken:
 | `no_ws_direct_write_check` | `check_no_ws_direct_write.sh` | Every WebSocket data frame goes through `webui_send.c`'s `write_frame()`, which holds it while earlier output is still going out; never a direct `lws_write()` |
 | `messaging_send_funnel_check` | `check_messaging_send_funnel.sh` | Every messaging driver send goes through `messaging_deliver` (per-provider formatting and escaping) |
 | `tool_action_kinds_check` | `check_tool_action_kinds.sh` | Every tool's action-kinds table names its own actions, and each prepare names a listed confirm |
+| `tool_error_mark_check` | `check_tool_error_mark.sh` | An "Error" literal a tool returns through `strdup()` or `make_response()` starts with `TOOL_RESULT_ERROR_MARK`, or it counts as a success (an error formatted into a buffer and returned later is not checked) |
 | `llm_blocks_confined_check` | `check_llm_blocks_confined.sh` | Stored turn blocks (`messages.llm_blocks`) are read only to rebuild an LLM request |
+| `llm_selection_resolved_check` | `check_llm_selection_resolved.sh` | A session's LLM settings are read resolved (`session_get_llm_config`); only the writers that store them back read them raw |
 | `message_kind_confined_check` | `check_message_kind_confined.sh` | Request-context rows (a `messages.kind`) are never shown, searched, counted or extracted |
 | `user_removal_marked_check` | `check_user_removal_marked.sh` | A delete a user makes is marked as their removal, so it is withdrawn from conversations |
 | `blob_marker_sync_check` | `check_blob_marker_sync.sh` | The chat-attachment blob marker agrees across its producer, parser and orphan sweep |
@@ -346,7 +370,9 @@ DAWN keeps the thread count small. The main thread owns the voice state machine,
 │  WebUI audio     — per-connection ASR/TTS pipeline     │
 │  Messaging recv  — per-provider listener (Telegram/    │
 │                    Slack/Discord WS or poll)           │
-│  Messaging work  — inbound dispatch + async outbound   │
+│  Messaging work  — inbound dispatch + async outbound;  │
+│                    one worker for every channel, never │
+│                    waits for a held conversation       │
 │  Job worker      — detached per background job (ASR-   │
 │                    less LLM tool loop on a pool session)│
 │  Reinvoke worker — detached per re-engagement (runs a  │
@@ -376,6 +402,9 @@ DAWN keeps the thread count small. The main thread owns the voice state machine,
 │                    learned from a conversation made    │
 │                    private; forgets one fact, all of   │
 │                    them (waits out an extraction)      │
+│  Memory undo     — detached, one per user: undoes or   │
+│                    keeps what a consolidation batch    │
+│                    did (waits out an extraction)       │
 │  Music player    — one per playing music player (each  │
 │                    WebUI music session's, and the      │
 │                    local speaker's): opens tracks      │
@@ -392,6 +421,35 @@ DAWN keeps the thread count small. The main thread owns the voice state machine,
 │                    WebUI email request and kept until  │
 │                    shutdown: the panel's email work,   │
 │                    off the lws thread                  │
+│  Coding watcher  — one, with an agent gateway declared:│
+│                    long-polls its events onto coding   │
+│                    jobs; cursor file in the data dir;  │
+│                    when a job waits, stages its        │
+│                    approval on the WebUI tab viewing   │
+│                    its chat (history_mutex, then the   │
+│                    tool's pending mutex, never nested);│
+│                    stopped by the tool's stop          │
+│  Coding report   — transient, one per coding job's end │
+│                    with a chat to report into: a       │
+│                    no-tools take on a borrowed job     │
+│                    slot (or a fixed line), posted      │
+│                    there; waited for by the tool's stop│
+│  Coding cancel   — transient, one per cancelled coding │
+│                    job: asks the agent gateway to stop │
+│                    its task; waited for by the tool's  │
+│                    stop                                │
+│  Coding card     — transient, one per WebUI card ask   │
+│                    (coding_pending) or click           │
+│                    (coding_reply, one per job at a     │
+│                    time), grants list, changes viewer  │
+│                    request (coding_view, one per user, │
+│                    newest wins), or the viewer's       │
+│                    publish preview, Publish or Close   │
+│                    (one per job at a time, with the    │
+│                    card's replies): asks the gateway,  │
+│                    answers the user's tabs (a view or  │
+│                    a button: the asking tab only);     │
+│                    waited for by the tool's stop       │
 │  Email fan-out   — transient, one per enabled account  │
 │                    (≤16) for an all-accounts email     │
 │                    search from the tool, joined before │
@@ -406,7 +464,30 @@ database backs (the local owner, watches, interrupted jobs, OTA releases, embedd
 TTS and the WebUI, whose turns have all of that. Last come the inputs that start the moment they
 connect: MQTT's loop and the tools' `start` (the Telegram, Discord and Slack listeners, which take their
 backlog at once), then the scheduler, whose first pass fires the events missed while DAWN was down. No
-thread waits a fixed time for another to be ready.
+thread waits a fixed time for another to be ready. Shutdown mirrors it: once the WebUI has stopped taking
+requests and the LLM thread is joined, the tools' `stop` runs (last registered first), before
+background jobs, the database and MQTT go; the tools' `cleanup` comes last.
+
+**One turn per conversation.** The turn queue serializes turns per session; the conversation lease
+(`conv_turn_lease.c`) serializes them per conversation, so two sessions on one conversation (a tab and
+another client app, a tab and a job or a channel) never run turns on it at once. A turn on a held
+conversation waits on its own thread (a text, voice or job worker), telling its
+client (`turn_waiting`), and counts as in flight while it waits (the idle sweep never reaps its session);
+a Stop or a teardown wakes the wait at once and ends it before anything of the turn is saved, and a
+turn whose client is gone stops waiting after `[jobs] max_runtime_sec`. The messaging worker, one thread
+for every channel, never waits: it takes a channel's conversation with a try (`conv_turn_lease_try_acquire`)
+and, while it is held, keeps the message on its own list (`messaging_engine_parked.c`, at most 16 per
+channel and 64 in all), looks again every 250 ms and runs a channel's messages in arrival order. Posts from outside a turn
+(`conv_post.c`: a job's report, a channel message DAWN sent) never wait: the holder's release writes
+them before the next turn starts. Each turn releases its lease at its end; the session's free releases
+any lease still naming it, with an ERROR, unless that lease's holder is releasing it right then (its
+release hands it on). Holding the lease, a turn brings its session's history up to
+date with the conversation (`session_catchup.c`): each session records the conversation's stored state
+its history was built at (newest row, watermark, reasoning floor, frozen prompt, tool set, in-force
+record; one indexed read), set where it is loaded and where a turn holding it ends; at the next turn's
+start, rows only added since are appended as a reload renders them, and any other change builds the
+history again as a restore does. A catch-up that fails leaves the history's state unknown at the turn's
+end, so the next turn builds it again.
 
 **Turn serialization (background-jobs era).** All WebUI LLM turns — user text, push-to-talk
 voice, and background-job re-engagements — funnel through the per-session **turn queue**
@@ -486,10 +567,25 @@ During PROCESSING the LLM call runs on a worker thread. The main thread continue
 **CRITICAL**: to prevent deadlocks, the codebase follows a strict acquisition order when multiple locks are needed. Mutexes fall into three categories by scope:
 
 ```
+Conversation turn lease (src/core/conv_turn_lease.c) — OUTERMOST for a turn:
+  a turn takes its conversation's lease (session_turn_begin, or its bind to one) with NO lock held
+  (no history_mutex, session registry, auth_db, turn-queue or job-pool lock), on its own thread, and
+  waits for at most one conversation.  The WebSocket thread and the messaging worker never wait on
+  it: the first only claims a conversation it just created and posts, the second only tries
+  (conv_turn_lease_try_acquire) and keeps a message for a held conversation on its own list.  The lease's own s_mutex is a LEAF:
+  held only to update the table, never across the post writer, a stop check or a log line; any lock
+  may be held while taking it (session_cancel_turn and session_teardown_flags wake a waiting turn
+  through it, under the job pool lock, the session registry or history_mutex).  A post
+  (conv_post.c) never waits, so two turns can't deadlock posting into each other's conversations
+
 Global daemon locks (src/dawn.c):
   llm_mutex              — LLM worker thread ↔ main thread buffer transfer
   tts_mutex              — TTS engine (Piper) serialization
   conversation_mutex     — conversation history list
+  g_config_rwlock        — the live dawn.toml settings.  Readers include the LLM-settings getters
+                           (session_get_llm_config, llm_resolve_config, llm_selection_problem),
+                           taken with no session lock held; a writer (a settings save) never calls
+                           into session LLM state
 
 Per-session locks (src/core/session_manager.c):
   session->history_mutex    — session conversation history
@@ -502,6 +598,11 @@ Per-session locks (src/core/session_manager.c):
    copy under the lock; the order is session_manager_rwlock, ref_mutex, fd_mutex, then one of these)
 
 Per-module locks (scoped to a single subsystem):
+  g_config_rwlock (src/config/)                   — the live dawn.toml settings.  Readers copy what they need and
+                                                    release (llm_default_selection's snapshot).  A settings save holds
+                                                    it for write across config_write_toml(), which takes
+                                                    tool_registry::s_registry_mutex, so it comes BEFORE that mutex;
+                                                    never take it while holding the registry mutex
   auth_db mutex (src/auth/auth_db_core.c)         — SQLite serialization
   tool_registry::s_registry_mutex                 — tool lookup table
   embedding_engine::s_embed_mutex                 — embed provider serialization
@@ -511,6 +612,9 @@ Per-module locks (scoped to a single subsystem):
   utterance_dedup::s_mutex (utterance_dedup.c)    — cross-device dedup slots (leaf)
   attention::s_mutex (src/core/attention/attention_core.c) — SAGE watch cache + event queue + metrics (leaf)
   turn_queue::s_turn_queue_mutex (src/core/turn_queue.c)   — per-session turn-serialization queue (LEAF; never held across the spawn/free closures)
+  messaging_engine::s_session_slots_mutex (src/messaging/messaging_engine_session.c) — the channels' live sessions; a session's
+                                                                     ref_mutex is taken under it only to retain or release one, and its
+                                                                     LLM settings are set after it is released
   focus_source::s_registry_mutex (src/core/focus/focus_source.c) — the retrieval-adapter registry (LEAF: held only to
                                                                      register or clear an adapter; adapters register once at
                                                                      startup, so a turn's focus_compose reads the registry
@@ -582,7 +686,7 @@ Per-module locks (scoped to a single subsystem):
                                                                      open, so never s_speaker_mutex there)
   music_queue::s_user_queues_mutex (src/audio/music_queue.c)    — the per-user queue registry (held across a queue's first load
                                                                      from music.db; taken under s_music_teardown_mutex, never the reverse)
-  music_queue_db::s_db_mutex (src/audio/music_queue_db.c)      — the one music.db connection queues are saved through (LEAF: held
+  music_queue_db::s_db_mutex (src/audio/music_queue_db.c)      — the one music_queue.db connection queues are saved through (LEAF: held
                                                                      across a save, load or delete, under a queue_mutex or s_user_queues_mutex)
   tool_result_store::s_cache_mutex (src/core/tool_result_store.c) — the parsed-tree cache's slots (LEAF: may be taken under
                                                                      history_mutex; held only to find, pin, insert and release a slot, never across a render)
@@ -595,6 +699,7 @@ Per-module locks (scoped to a single subsystem):
                                                                      again to delete.  Never run image_store_cleanup / image_store_reclaim_unbound
                                                                      while holding a history_mutex or the auth_db lock
   job_manager::s_pool_mutex (src/core/job_manager.c)       — background-job session pool (REGISTRY tier, like session_manager_rwlock: released before any ref-cond wait, session_free, or conv_db_*/scheduler_* callout)
+  job_manager::s_kind_cancel_mutex (src/core/job_manager.c) — job kinds' cancel hooks (LEAF: held only to register or look up a hook; the hook runs with it released)
   job_reinvoke::s_inflight_mutex (src/core/job_reinvoke.c) — per-parent reinvoke in-flight set (leaf)
   memory_embed_backfill::s_backfill_mutex (src/memory/memory_embed_backfill.c) — embedding-backfill request queue (LEAF; never held across an embed or DB call; joins an already-exited worker while held — safe only because the worker takes no lock after clearing s_backfill_running)
   document_embed_cache::s_cache.mutex (src/tools/document_embed_cache.c) — in-memory document-chunk embeddings (LEAF: never held across a database call; a rebuild reads pages outside it, then installs; scoring holds only this)
@@ -625,6 +730,13 @@ Per-module locks (scoped to a single subsystem):
                                                                      registry, then its metrics_mutex for the owner check) BEFORE the deliver_mutex is
                                                                      taken.  A deliberate module-before-session exception to rule 1: the send only
                                                                      queues, so nothing waits on a session while it's held
+  memory_consolidation_undo::s_inflight_mutex (src/memory/memory_consolidation_undo.c) — users with an undo or
+                                                                     Keep running (LEAF: held only to claim or free a slot)
+  webui_coding::s_users_mutex + s_inflight_mutex + s_viewers_mutex + s_granting_mutex (src/webui/webui_coding.c)
+                                                                     — the coding card's lookups per user, replies per job, the
+                                                                     changes viewer's request per user and the grants list's per user
+                                                                     (LEAVES: held only to claim, merge or release a slot; never across a
+                                                                     gateway call or a broadcast)
   email_undo::s_mutex (src/tools/email_undo.c) — the trash/archive undo tokens (LEAF: held only to add, claim, finish or release
                                                                      a token; never across a call into anything else)
   email_service_move::s_pace_mutex (src/tools/email_service_move.c) — Gmail's per-account call pacing, shared by the tool and
@@ -899,7 +1011,7 @@ gemini_api_key = "..."
 
 **`include/prompts.h`** — every prompt and directive sent to a model, including the defaults `dawn.toml` can replace: the persona's two halves (`AI_PERSONA_VALUES`, who the assistant is, then `AI_PERSONA_VOICE`, how it talks), the voice-output directives (`DEFAULT_VOICE_OUTPUT_DIRECTIVE`, `_WEBUI`) and the ASR disambiguation hint.
 
-**`models.toml`** — model context-window registry (per-model-prefix → max input tokens for OpenAI/Anthropic/Gemini). Read-only reference data loaded once by `llm_context.c` at startup; **exempt from the `dawn.toml` settings round-trip** (never rewritten). Edit + restart to update; no rebuild. OpenRouter/local windows are fetched live and not listed. See [MODELS_TOML_DESIGN.md](docs/MODELS_TOML_DESIGN.md).
+**`models.toml`** — model reference data: context windows, prices and reasoning capabilities per model prefix for OpenAI/Anthropic/Gemini. Read-only reference data loaded once by `llm_context.c` at startup; **exempt from the `dawn.toml` settings round-trip** (never rewritten). Edit + restart to update; no rebuild. OpenRouter/local windows are fetched live and not listed. See [MODELS_TOML_DESIGN.md](docs/MODELS_TOML_DESIGN.md).
 
 **Tool registry** — tools are defined as compile-time `tool_metadata_t` structs in `src/tools/*.c` and registered in `src/tools/tools_init.c` via `tools_register_all()`. See [command-processing.md](docs/arch/command-processing.md).
 
@@ -1028,11 +1140,11 @@ The session manager, response queue, LLM pipeline, tool system, and conversation
 
 ## Command Processing
 
-DAWN supports three parallel command-processing paths — direct regex matching, native LLM tool calls, and legacy `<command>` tags — that all converge on a single unified executor (`command_execute()`).
+DAWN supports two parallel command-processing paths — direct regex matching and native LLM tool calls — that both converge on a single unified executor (`command_execute()`).
 
 - **Tool registry** (`src/tools/tool_registry.c`): self-registration with FNV-1a hash tables for O(1) lookup, automatic schema generation for multiple LLM providers, and capability flags (`TOOL_CAP_NETWORK`, `TOOL_CAP_DANGEROUS`).
 - **Processing mode** is selected in `dawn.toml`: `direct_only`, `llm_only`, or `direct_first`.
-- **Native tools** vs. **legacy `<command>` tags** use the same enable/disable flags and the same executor; only the transport differs.
+- **Native tool calling** is the only way a model calls a tool; `[llm.tools] enabled` turns it off. Text a model writes is never parsed for commands.
 
 **Full flowchart, tool list, and definition sources**: see [command-processing.md](docs/arch/command-processing.md).
 

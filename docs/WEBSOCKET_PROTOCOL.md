@@ -95,6 +95,8 @@ When to add what:
 
 | Flag | Since | Meaning |
 |------|-------|---------|
+| `stopped_replies_saved` | 2026-11-18 | A reply the user stops (`cancel`, or `stop_other_reply` from another of their clients when the stopped turn is a WebUI client's) while it streams is saved as far as it had streamed: its `stream_end` has `reason` `"stopped"`, with `will_persist: true` when the row is saved (nothing is saved when nothing of the reply was left), and the row comes back with `stopped: true` on `message_appended`, `load_conversation_response` rows, `get_memory_fact_source_response` messages and exports. Show the saved text (it can differ from what was drawn: tags removed) and mark it stopped. Only the user's Stop does this; any other end of a turn is as before. Without it, a Stop mid-stream ends with `reason` `"error"` and saves nothing. |
+| `memory_batches` | 2026-11-03 | The daemon records what memory learned per batch and answers `list_memory_batches`, `undo_memory_batch` and `keep_memory_op`, and pushes `memory_batch` (see Memory Management, Consolidation). Advertised while memory is enabled; a build without the WebUI never advertises it. Without it, offer no marker, Learned tab or undo. |
 | `email_refs` | 2026-10-09 | A `text` frame may carry `email_refs`: one email the user attached, by account and message id. The model reads it with the email tool, and the question row comes back with `email_ref` on every frame that delivers it (see Email, Email in chat). Advertised with `email_client`. Without it, send no `email_refs` (an older daemon ignores them, and the model never sees the email). |
 | `email_client` | 2026-10-07 | The mail panel's verbs answer: `email_list`, `email_search`, `email_read`, `email_set_flags`, `email_unread_counts`, `email_archive`, `email_trash`, `email_undo`, and the server pushes `email_changed` (see Email). Advertised only while the email service is up; a build without the WebUI or the email tool never advertises it. |
 | `document_attachments` | 2026-10-02 | A `text` frame may carry its documents as `attachments` (`[{filename, size, content, blob_id?}]`): the daemon defuses each body and filename and builds the `[ATTACHED DOCUMENT: …]…[END DOCUMENT]` text itself, so a document can't end its own span. Without it, inline the documents into `text` as before. Every daemon with it also has `turn_refs`. |
@@ -104,6 +106,8 @@ When to add what:
 | `image_turns_by_id` | 2026-10-01 | A `text` turn takes images only through `image_ids`; `images[]` is ignored. A malformed, missing or foreign id, or too many, refuses the whole turn with `IMAGE_UNAVAILABLE` / `IMAGE_LIMIT` / `IMAGE_ERROR` and saves nothing (see `text`). Without it, send `images[]` with `image_ids` as before: older daemons send the model only `images[]`. |
 | `app_logins` | 2026-09-30 | One login per app: `"app"` on login, `?app=` on every other request, a cookie per app (see Connection Lifecycle). Without it, all front-ends in a browser share one login. |
 | `login_unavailable` | 2026-10-30 | A login the daemon couldn't check is never reported as ended: `SERVICE_UNAVAILABLE` on the socket (still logged in), `503` over HTTP, `1013` for a socket connecting then, and `1012` for every socket when a shutdown begins (see Transport, When the login can't be checked). So `UNAUTHORIZED`, `"authenticated":false` and `4002` mean the login ended. Without it, a daemon restart can look like a revoke: re-check `/api/auth/status` before signing out. |
+| `request_refs` | 2026-11-16 | Any message may carry `req` in its payload (an opaque id: at most 64 bytes of valid UTF-8, no control characters; anything else is ignored). While the daemon handles the message, every `error` it sends to that connection carries the same `req` and `request_type` (the message's `type`, with or without a `req`), and every `*_response` it sends there carries `req`. So a refusal such as `UNAUTHORIZED`, `SERVICE_UNAVAILABLE` or `FORBIDDEN` names the request it refused, whatever order frames arrive in. Not covered: frames that aren't a `*_response` (`session` and the rest of the `init` / `reconnect` batch, `state`, `pong`, `music_state`), `restart_response`, a `text` turn's errors (queued, and matched by `client_ref`: flag `turn_refs`), and a reply sent later from another thread, which carries `req` only where its verb says so (the email verbs). Without the flag, match replies by type and order. |
+| `turn_wait` | 2026-11-16 | One turn runs on a conversation at a time. A turn sent while another (another tab, another app, a background job, a messaging channel) runs on the same conversation waits for it: the sender gets `turn_waiting` (`waiting: true`) and then `turn_waiting` (`waiting: false`) when its turn starts, or `turn_unsent` if it was stopped first (nothing of it was saved). `stop_other_reply` stops the turn it waits for. Without the flag a client still gets a `state` `thinking` with a `detail` (`Finishing the reply already in progress…`) while it waits, then the normal stream; ignore the unknown frames. |
 | `logout_closes_sockets` | 2026-09-30 | `POST /api/auth/logout` with the socket open is safe: the login's connections get `force_logout` and close with `4002`, the server closes the music socket, and the reply comes at once with the cookie cleared (see Connection Lifecycle, Logging out). Without it, close the socket before logging out. |
 
 A client says who it is in its `init` / `reconnect` payload:
@@ -217,6 +221,27 @@ Cancel the current LLM operation for this session.
 ```json
 {"type": "cancel"}
 ```
+A turn still waiting for another turn on its conversation (`turn_waiting`, flag `turn_wait`)
+stops waiting: it ends with `turn_unsent` and nothing of it is saved.
+
+#### `stop_other_reply`
+Stop the turn this session's turn waits for (flag `turn_wait`): the one holding the
+conversation, run by another session of the same user (another tab or app, a background job, a
+messaging channel).
+```json
+{"type": "stop_other_reply", "payload": {"conversation_id": 123}}
+```
+Answered with `stop_other_reply_response` once the stop is asked for, not when that turn ends:
+```json
+{"type": "stop_other_reply_response",
+ "payload": {"conversation_id": 123, "success": true}}
+```
+- `error` (with `success: false`): `NOT_RUNNING` (no turn of the user's holds the conversation,
+  including another user's, which answers the same, or the turn ended before the stop reached
+  it) or `FORBIDDEN` (the turn holding it is this session's own: use `cancel`).
+- A background job's own turn is cancelled as the job (recorded as cancelled); any other turn
+  is stopped as `cancel` stops it. A turn inside a tool call stops when the call returns; the
+  waiting turn then starts.
 
 #### `reconnect`
 Reconnect to an existing session using a stored token.
@@ -295,7 +320,7 @@ clamped server-side (default 25, max 50). Response: `list_jobs_response`.
 ```
 
 #### `job_action`
-Cancel or resume one background job. Ownership is checked against the connection's
+Cancel, resume or delete one background job. Ownership is checked against the connection's
 authenticated user **before** acting; a job belonging to someone else and a job
 that does not exist give the same answer, so this cannot be used to probe for
 other users' job ids. Always answered with `job_action_response`.
@@ -306,6 +331,103 @@ other users' job ids. Always answered with `job_action_response`.
 - `resume` — re-dispatches an `interrupted` or `failed` job, continuing its
   existing transcript. Counts as a spawn against the job caps. Refused for
   `done` (it has an answer), `cancelled` (stopped deliberately), and `running`.
+- `delete` — deletes a finished job's conversation, as `delete_conversation` does
+  (its child jobs and images go with it), then sends `jobs_invalidate`. Refused while
+  the job is queued or running, and for a coding job whose task the agent gateway may
+  still hold (its trail has gateway events and none saying the task was closed): close
+  it first. `delete_conversation` refuses the same two.
+
+#### `coding_pending`
+What coding jobs wait on (built with the coding agent only). Asks the agent gateway,
+so the answer, `coding_pending_response`, comes a little later and goes to every tab
+of the user. Jobs that aren't the user's coding jobs are left out of it. At most 16 ids.
+One lookup per user runs at a time; asks that arrive meanwhile are merged into the next.
+```json
+{ "type": "coding_pending", "payload": { "jobs": [1977, 1983] } }
+```
+
+#### `coding_view`
+The changes viewer: a coding job's work, read from the agent gateway's mirror (never
+shown to the model). `what` is `changes` (the changed files and commits) or `file`
+(one file: `path` exactly as `changes` listed it, `"old -> new"` for a rename;
+`view` `diff`, the default, or `new`). `scope` (optional, either `what`) narrows the
+view: `all` (the default, the whole job), `since_push` (after the last published head)
+or one of the job's commits by hash (4-40 lowercase hex digits; against its first
+parent, and for a merge only its files with conflicts); view only, Publish and Close
+still act on the whole job. The user's own coding job only. One request
+per user at a time; a newer one replaces one still waiting. Answered with
+`coding_view_response`, to the asking tab only; `nonce` (optional, up to 39
+characters) is echoed so the tab renders only its latest.
+```json
+{ "type": "coding_view", "payload": { "job": 42, "what": "file", "path": "src/a.c", "view": "diff", "nonce": "v3" } }
+```
+
+#### `coding_publish_preview`
+The changes viewer's **Publish…**: DAWN's own preview of what publishing the coding job
+would push and open, built with the same checks as the coding agent tool's publish. The
+user's own coding job only. Answered with `coding_publish_preview_response`, to the
+asking tab only; `nonce` (up to 39 characters) is echoed.
+```json
+{ "type": "coding_publish_preview", "payload": { "job": 42, "nonce": "a1" } }
+```
+
+#### `coding_publish`
+Publish a coding job from the preview the user saw: `head` (the preview's full commit
+hash) and `pr_body_sha256` (the preview's) bind the click to that preview; the gateway
+refuses when the branch moved or the description changed since. The user's own coding
+job, finished (`done`). The title is the agent's, else the job's name (set by the server).
+Optional `pr_title` and `pr_description` are the user's own text for a new pull request,
+sent instead of the agent's: the title as one line (up to 120 bytes), the description up
+to 5900 bytes with the preview's `pr_footer` appended by the gateway; with
+`pr_description`, `pr_body_sha256` may be left out. The user's own text is refused when
+the job already has an open pull request (its text is edited on GitHub); its new commits
+still go there. On success DAWN
+posts its line to the job's parent conversation and drops any publish staged in chat for
+that job. Answered with `coding_publish_response`, to the asking tab only.
+```json
+{ "type": "coding_publish", "payload": { "job": 42, "head": "4f1c…(40 hex)", "pr_body_sha256": "9a0b…", "nonce": "a2" } }
+```
+
+#### `coding_close`
+Close a coding job (its clone and branch go; it can't be revised afterwards). Without
+`confirm`: closes when nothing would be lost, and otherwise answers with
+`needs_confirm`. With `confirm: true` ("Close anyway"): closes with `head`, the head the
+`needs_confirm` answer showed (`""` when only uncommitted edits would be lost); refused
+when the work changed since. The `confirm` key, not an empty head, tells the two apart.
+Answered with `coding_close_response`, to the asking tab only.
+```json
+{ "type": "coding_close", "payload": { "job": 42, "nonce": "a3", "confirm": true, "head": "" } }
+```
+
+#### `coding_grants`
+The user's standing approvals for the coding agent (hosts and tools allowed for every
+task on a repo, or every repo). Answered with `coding_grants_response`.
+```json
+{ "type": "coding_grants", "payload": {} }
+```
+
+#### `coding_grant_revoke`
+Remove one standing approval; the gateway removes only the user's own. Answered with
+`coding_grants_response` carrying the result and the list as it now stands.
+```json
+{ "type": "coding_grant_revoke", "payload": { "id": 3 } }
+```
+
+#### `coding_reply`
+The user's answer to one open request of a coding job, from a card. `decision` is
+`allow` (this task), `allow_repo` (every task on the job's repo), `deny`, or `answer`
+(with `answer`, the user's words, at most 2000 characters, for a question). For
+`allow`/`allow_repo` send `line`, the line the card showed. The server checks the
+click against the live request: the job is the user's coding job and the request is
+still open; Allow only when DAWN can show what it asks and `line` still matches;
+`allow_repo` only when the repo can be named; answers only for questions (at most
+2000 bytes), decisions only for hosts and tools (`deny` on a question declines it).
+One reply per job at a time. `nonce` (optional, up to 39 characters) is echoed back,
+so the tab that clicked can tell its answer from another tab's. Answered with
+`coding_reply_response`, to every tab of the user.
+```json
+{ "type": "coding_reply", "payload": { "job": 1977, "request_id": 12, "decision": "allow", "line": "reach the host `downloads.arduino.cc`" } }
+```
 
 ### Configuration (Admin Only)
 
@@ -332,7 +454,7 @@ session's *resolved/actual* LLM state (not just config defaults):
 }
 ```
 - `thinking_mode` / `reasoning_effort`: the session's current reasoning settings (same
-  vocabulary as `set_llm_runtime`). This is the only place a fresh connection learns
+  vocabulary as `set_session_llm`). This is the only place a fresh connection learns
   them — `llm_state_update` is only pushed on a `switch_llm` tool call.
 
 #### `set_config`
@@ -408,21 +530,6 @@ Response: `list_llm_models_response`
 
 ### LLM Runtime Control
 
-#### `set_llm_runtime`
-Switch LLM type/provider globally. **Admin only.** Affects all clients.
-```json
-{
-   "type": "set_llm_runtime",
-   "payload": {
-      "type": "cloud",
-      "provider": "claude"
-   }
-}
-```
-- `type`: `"local"` or `"cloud"`
-- `provider`: `"openai"`, `"claude"`, or `"gemini"`
-- Response: `set_llm_runtime_response`
-
 #### `set_session_llm`
 Configure LLM settings for this session only (does not affect other clients).
 ```json
@@ -438,9 +545,40 @@ Configure LLM settings for this session only (does not affect other clients).
 }
 ```
 - All fields are optional, only provided fields are changed
-- `type`: `"local"`, `"cloud"`, or `"reset"` (revert to defaults)
+- Send a pick as one message: `type`, `provider` (for cloud) and `model` together
+- `type`: `"local"`, `"cloud"`, or `"reset"`: no selection of its own, so the session
+  follows the dawn.toml default (resolved at each turn) with the default reasoning; other
+  fields in the same message apply over it.  `"cloud"` without `provider` means the
+  session's cloud provider, else the one dawn.toml names
+- `provider`: `"openai"`, `"claude"`, `"gemini"`, `"openrouter"`; `"local"` means local;
+  `"none"` (what the server sends for a local selection) names none.  A changed provider
+  clears the model (its default), so one vendor's model never goes to another
+- `model` alone (no `type` or `provider`) moves the session to cloud only when a dawn.toml
+  cloud model list names it exactly; otherwise it stays where it is
+- A pick that can't run (its provider has no API key, an unknown provider) is refused:
+  `success` false, `error` the reason, nothing stored, and the payload carries the session's
+  current settings to resync from.  A restore (`from_restore`) or a `"reset"` is checked at
+  its next turn
+- `from_restore`: true when the client replays a loaded conversation's settings; the server
+  then doesn't save them back to the active conversation
+- The response, `llm_runtime` in `get_config_response` and a loaded conversation's
+  `llm_settings` carry `follows_default` (true: no selection of its own; the values shown
+  are the default's). A client restores such a conversation with `"reset"`.
 - `thinking_mode`: `"disabled"`, `"auto"`, or `"enabled"`
 - `reasoning_effort`: `"low"`, `"medium"`, or `"high"`
+- `type: "local"` with no `model` clears a model the session carried over from a cloud
+  session, or a bare cloud model name. The session then runs the configured local model
+  until one is named.
+- When setting a local model, send `type: "local"` with `model`. Without the type, a name
+  that starts like a cloud model's (Ollama's `gpt-oss`) is taken for a cloud model and the
+  session moves to cloud.
+- `from_restore`: `true` applies the settings to the session without saving them to the
+  active conversation (a loaded conversation's own settings, or a model the client
+  detected rather than the user picked).
+- `conversation_id`: optional; the conversation the change was made in (`0`: one not
+  saved yet). When it isn't the connection's active conversation, nothing in the request is
+  applied or saved (the session now carries that conversation's settings): the reply is
+  `success` false with the current settings.
 - Response: `set_session_llm_response`
 
 #### `get_system_prompt`
@@ -686,9 +824,13 @@ Load a saved conversation into the current session.
 ```
 Response: `load_conversation_response`
 
+The response's `llm_settings.model` is `""` when the conversation stores no model and is
+not on the default type and provider: it runs that type's or provider's own default.
+
 A user row that asked about an attached email carries `email_ref` (an object:
 `account_id`, `message_id`, `from`, `subject`; see Email, Email in chat). Rows without one
-have no such field.
+have no such field.  An assistant row the user stopped before it finished carries
+`stopped: true` (flag `stopped_replies_saved`); other rows have no such field.
 
 #### `set_active_conversation`
 Re-anchor the connection's active conversation **without** replaying history — a
@@ -860,19 +1002,25 @@ Update context token counts for a conversation in the database.
 No response (fire-and-forget).
 
 #### `lock_conversation_llm`
-Lock a conversation to a specific LLM provider/model.
+Store a new conversation's LLM settings with its first message (only while it has none).
 ```json
 {
    "type": "lock_conversation_llm",
    "payload": {
       "conversation_id": 42,
-      "llm_type": "cloud",
-      "llm_provider": "claude",
-      "llm_model": "claude-sonnet-4-5"
+      "llm_settings": {
+         "llm_type": "cloud",
+         "cloud_provider": "claude",
+         "model": "claude-sonnet-4-5",
+         "thinking_mode": "enabled",
+         "reasoning_effort": "medium"
+      }
    }
 }
 ```
-Response: `lock_conversation_llm_response`
+- Empty `llm_type`, `cloud_provider` and `model`: the conversation has no selection of
+  its own and follows the default (`follows_default`); only its reasoning is stored.
+- Response: `lock_conversation_llm_response`
 
 #### `continue_conversation`
 Continue a conversation after context compaction (create new DB entry linked to old).
@@ -972,6 +1120,24 @@ Search through stored memories.
 ```
 Response: `search_memory_response`
 
+#### `list_memory_entities`
+List entities (the Graph tab), most mentioned first.
+```json
+{"type": "list_memory_entities", "payload": {"limit": 20, "offset": 0}}
+```
+Response: `list_memory_entities_response`, with `entities`, `count` and `has_more`. Each
+entity (the same shape as the `entities` of `search_memory_response`) is a card: the entity and
+its aliases. Aliases are not listed on their own, but `count` and `has_more` count the entity rows
+read, aliases included: advance `offset` by `count`, not by `entities.length`.
+
+| Field | Meaning |
+|---|---|
+| `id`, `name`, `canonical_name`, `entity_type` | The entity |
+| `mention_count`, `first_seen`, `last_seen` | Across its aliases |
+| `alias_count`, `is_user_self` | Linked aliases; whether it is the user |
+| `relations` | Its relations, outgoing first, then incoming from outside the card. Each has `relation`, `object_name`, `object_entity_id`, `direction` (`out`/`in`), `confidence`, `mention_count`, and `valid_from`/`valid_to` when set. For `in`, `object_name`/`object_entity_id` name the other end's card |
+| `relations_total` | All of the card's relations. At most 50 per direction are sent, most seen first; when `relations_total` is larger, the rest exist but weren't sent |
+
 #### `get_memory_fact_source`
 Return the verbatim source conversation messages a fact was extracted from (memory provenance).
 ```json
@@ -1001,8 +1167,8 @@ messages (system/tool messages are omitted):
    }
 }
 ```
-A user message that asked about an attached email carries `email_ref`, as in
-`load_conversation_response`. An empty `messages` array with `success: true` means the range
+A user message that asked about an attached email carries `email_ref`, and a stopped reply
+`stopped: true`, as in `load_conversation_response`. An empty `messages` array with `success: true` means the range
 held no user/assistant messages (only system/tool). On failure, `success` is `false`
 and `reason` is one of: `not_available` (no provenance recorded, fact not
 found, source conversation deleted, or private), `forbidden` (the source
@@ -1019,7 +1185,7 @@ Delete a specific memory fact.
    }
 }
 ```
-Response: `delete_memory_fact_response` with `success`, and `error` on failure ("Memory is still being
+Response: `delete_memory_fact_response` with `success`, the `fact_id` asked for, and `error` on failure ("Memory is still being
 saved; try again in a moment" while an extraction for the user runs past the wait; "Memory is busy with
 another change; try again shortly" when the user already has several deletes running). The duplicates
 merged into it are deleted with it; the values it replaced are current again: `restored_count` says how
@@ -1072,6 +1238,216 @@ Response: `restore_memory_fact_response` with `success`, `fact_id`, `both_curren
 that replaced it stays current too) and `error` on failure
 (the fact isn't the caller's, or was already restored or deleted).
 
+#### Consolidation: what memory learned per batch
+
+With `memory_batches` advertised.  Each time memory consolidates a conversation (a *batch*, run
+when the conversation ends or goes quiet with `[memory] consolidator = "agent"`), DAWN records
+what it did: each fact it added, reinforced, merged or replaced, each relation it closed, each
+entity it linked, each preference it set, and each candidate it dropped or set aside for later.
+A client shows a batch as a marker in its conversation and in a Learned list, and lets the user
+undo it, keep a candidate it dropped, or forget a fact it suggested forgetting.  Batches are not
+messages: they never appear in `messages`, the history, or what the model is sent.
+
+##### The batch object
+
+```json
+{
+   "batch_id": 412,
+   "conversation_id": 1703,
+   "conversation_title": "Trip planning",
+   "from_message_id": 26230,
+   "after_message_id": 26244,
+   "created_at": 1793000000,
+   "path": "agent",
+   "status": "applied",
+   "outside": true,
+   "outside_from": "email",
+   "counts": {"added": 3, "reinforced": 2, "merged": 1, "replaced": 1, "closed": 1,
+              "linked": 0, "proposed": 0, "pref_set": 1, "dropped": 4, "deferred": 1,
+              "suggested_forget": 0, "refused": 0},
+   "ops": [ ]
+}
+```
+
+- `conversation_id`: the conversation whose messages hold `after_message_id`: the one the batch
+  read, never the root of a continuation chain (a continued conversation is its own and gets its
+  own batches); `null` for a batch with none.
+- `conversation_title`: that conversation's title as it is when the frame is built (at most 255
+  bytes; may be `""`); `null` when `conversation_id` is `null` or the conversation is gone.  A
+  rename sends no `memory_batch`: update shown batches from `conversation_renamed`.  Absent on
+  daemons before 2026-11-17.
+- `from_message_id`: the first message the batch learned from.
+- `after_message_id`: place the marker after this.  It may name a row the client doesn't render
+  as a bubble (a tool row, an intermediate assistant row of a tool loop, a request-context row);
+  message ids grow within a conversation, so **place the marker after the greatest rendered
+  message id ≤ `after_message_id`**.  When none is rendered (a range the client hasn't loaded),
+  show the batch only in the Learned list.  `0` or absent: the Learned list only.  Rows are never
+  renumbered (compaction changes what the model is sent, not what is stored); a retracted turn's
+  rows are deleted, which the ≤ rule absorbs.
+- `path`: `agent`, or `agent_partial` when the run didn't finish and only what can't lose a
+  stored item was applied, or the batch filled its record (256 ops) and what didn't fit wasn't
+  applied.
+- `status`: `applied` · `partial` (some ops undone, some not) · `undone` (every op that can be
+  undone was).
+- `outside`: the batch read outside text (an email, a web page, ...).  `outside_from`: what it
+  read, `null` when `outside` is false: `web` · `email` · `research` (a research report) ·
+  `messaging` (a message from a chat channel) · `document` · `calendar` (a calendar event) ·
+  `mcp` (an MCP server's result) · `other` (any other tool's result, DAWN's own posts, a device's
+  data).  Show it once per batch ("Read outside text: an email").  A memory DAWN recalled into the conversation doesn't count,
+  whatever it was learned from, and neither does the user's own document (a note, or one marked
+  My own text: see Document Library).
+- `counts`: the batch's ops by kind (a link that became a proposal counts as `proposed`); refused
+  ops count in `refused` only and are not listed.
+
+##### Op rows
+
+```json
+{
+   "op_id": 9001,
+   "op": "merged",
+   "status": "applied",
+   "outside": false,
+   "outside_from": null,
+   "fact_id": 7690,
+   "relation_id": null,
+   "entity_id": null,
+   "text": "...",
+   "target_fact_id": 7702,
+   "target_entity_id": null,
+   "target_text": "...",
+   "target_status": "current",
+   "reason": "...",
+   "reason_by": "model",
+   "action": "undo"
+}
+```
+The row of the fact kept (7702 here), when this batch added or reinforced it, also carries what was
+merged into it:
+```json
+{"op_id": 9000, "op": "added", "fact_id": 7702, "sources": [{"fact_id": 7690, "text": "..."}]}
+```
+
+- `op`: `added` · `reinforced` · `merged` · `replaced` · `closed` · `linked` · `pref_set` ·
+  `dropped` · `deferred` · `suggested_forget`.
+- `status`: `applied` · `proposed` (a link that became a merge proposal for the user to decide) ·
+  `undone` · `stale` (an undo found the row changed since; nothing was done) · `kept` (a dropped or
+  set-aside candidate the user kept) · `consumed` (a set-aside candidate a later batch took up) ·
+  `expired` (a set-aside candidate past its 30 days).  There is no `forgotten` status: forgetting
+  a fact removes every row naming it, so an acted-on suggestion leaves the list.
+- `outside`, `outside_from`: the batch's taint (a kept or set-aside candidate: its own batch's).
+  Tag a row only when they differ from the batch's.  A stored fact's own taint is read from the
+  fact.
+- `fact_id`: the op's own fact; absent or `null` for `closed`, `linked` and `pref_set`.
+- `text`: the op's item when it was recorded: fact text, a relation as "subject predicate
+  object", an entity name, a preference as "category: value"; `null` for a candidate dropped
+  because the user forgot it.
+- `target_fact_id`: `merged`: the fact kept; `replaced`: the newer value; `closed`: the fact
+  whose value closed it (if any).  `target_entity_id`: `linked`: the entity linked to.
+- `target_text`: the counterpart when recorded (it may be gone since).  `target_status`:
+  `current` · `superseded` · `gone`, the counterpart now (computed when the list is built);
+  absent when the op has none.
+- `sources`: on this batch's `added` or `reinforced` row of a fact a merge of this batch landed on:
+  the facts merged into it.  Absent otherwise (a merge into a stored fact the batch didn't touch
+  has no row to carry it; its `merged` row names the fact kept).
+- `reason`: one line.  **Render it as text (`textContent`), never as markup.**  `reason_by` says
+  who wrote it: `model` (the model's words: show them as such, e.g. "Model's reason:") or `dawn`
+  (DAWN's own, e.g. "not reached"); absent with no reason, or on a row recorded before it was kept.
+- `action`: `undo` (an applied op that can be undone) · `keep` (an applied dropped candidate, or
+  a set-aside one open or expired) · `forget` (an applied `suggested_forget`: send the existing
+  `delete_memory_fact` with its `fact_id`, which records the forget) · `null`.
+- `text`, `target_text` and `reason` are cut when recorded, on a character boundary: 511, 511 and
+  200 bytes.
+
+##### `list_memory_batches`
+```json
+{"type": "list_memory_batches", "payload": {"conversation_id": 1703, "limit": 20}}
+{"type": "list_memory_batches", "payload": {"before_batch_id": 380, "limit": 20}}
+```
+Keyset pages, newest first: `before_batch_id` (absent: from the newest), `limit` (default 20, at
+most 50), and `conversation_id` (absent: every conversation's).  Response:
+```json
+{
+   "type": "list_memory_batches_response",
+   "payload": {
+      "conversation_id": 1703,
+      "before_batch_id": null,
+      "limit": 20,
+      "batches": [ ],
+      "has_more": true,
+      "next_before_batch_id": 371,
+      "error": null
+   }
+}
+```
+The request's form is echoed (`conversation_id` only when asked for).  `next_before_batch_id` is
+present only when `has_more` is true; send it as the next request's `before_batch_id`.  A page
+also stops early when its batches reach 256 KB (then `has_more` is true).  A conversation that
+doesn't exist and one that isn't the caller's answer the same: `"error": "Not found"`, no batches.
+
+##### `undo_memory_batch`
+```json
+{"type": "undo_memory_batch", "payload": {"batch_id": 412, "op_id": 9001}}
+```
+`op_id` absent: every op of the batch that can be undone, the last applied first (a closed relation
+last, after the value that closed it).  An `op_id` that is present but not a number is "Not
+found", never the whole batch.  Each op is checked against what it left; if anything else changed
+that row since (a later batch's op still in effect on the same fact, relation, link or
+preference, or, for a merge, on the fact kept; a merge onto a fact it added; another conversation
+teaching it; a restore), it is left as it is and marked `stale`.  A closed relation stays closed while another value of it is open.
+What an undo removes is withdrawn from the conversations it was sent into, like a forget, but no
+forgotten record is made: memory may learn it again.  It waits for the user's running memory
+extraction, on a worker; the reply comes when it ends:
+```json
+{
+   "type": "undo_memory_batch_response",
+   "payload": {"batch_id": 412, "op_id": 9001, "status": "ok", "undone": [9001], "stale": [],
+               "error": null}
+}
+```
+`status`: `ok` (everything asked for was undone; undoing again is `ok` too) · `partial` (a whole
+batch with some ops stale: `undone` and `stale` list them) · `stale` (nothing could be undone:
+"This memory changed since; nothing was undone.") · `error` ("Not found"; "This one can't be
+undone."; "Couldn't undo this right now. Try again in a moment." when the extraction wait or the
+database refused, or an undo or keep of the user's is already running).  A batch or op that
+doesn't exist, or isn't the caller's, or an op named with another batch's id, is "Not found".
+
+##### `keep_memory_op`
+```json
+{"type": "keep_memory_op", "payload": {"batch_id": 412, "op_id": 9010}}
+```
+Stores a dropped or set-aside candidate through the same path and checks a batch stores with,
+carrying the outside text it was recorded with (a kept candidate from an email is still marked as
+from outside text, never as the user's own word).  The op becomes `kept` and a new `added` op
+(or `reinforced`, when it says a stored fact again) joins the batch, which can be undone.  On a
+worker, like an undo:
+```json
+{
+   "type": "keep_memory_op_response",
+   "payload": {"batch_id": 412, "op_id": 9010, "status": "ok", "fact_id": 8140, "error": null}
+}
+```
+A candidate whose text a current fact already says is only marked `kept`, its `fact_id` that fact
+(nothing new joins the batch).
+`status`: `ok` · `error` ("Not found"; "You asked me to forget this; it stays forgotten." when a
+forgotten record says it; "This batch is full; nothing more can be kept from it." when the batch
+holds 256 ops; "This one can't be kept." when it was kept already or is about the assistant; "Couldn't
+keep this right now. Try again in a moment." when the extraction wait, the store or its record failed,
+or an undo or keep of the user's is already running: nothing is stored then).
+
+##### `memory_batch` (push)
+```json
+{"type": "memory_batch", "payload": { }}
+```
+The batch object, to every browser tab of the user, after a batch is recorded, after every undo or
+keep (before the reply), and after a fact one of its ops names is forgotten (a Forget from a
+suggestion removes that row).  Replace a batch already shown by `batch_id`.
+
+A batch a forget removed (its conversation forgotten) comes as its id alone:
+```json
+{"type": "memory_batch", "payload": {"batch_id": 412, "removed": true}}
+```
+Drop it (its row and its conversation marker) wherever it is shown.
+
 #### `delete_memory_preference`
 Delete a specific user preference.
 ```json
@@ -1110,6 +1486,39 @@ Response: `delete_all_memories_response` with `success` and `error` on failure. 
 waits for a memory extraction in progress; if one doesn't finish in time it fails with "Memory is still
 being saved; try again in a minute" and nothing is deleted. On success the user's conversations count as
 extracted, so their memories aren't learned again from them.
+
+---
+
+### Document Library (Authenticated)
+
+The library panel's other requests (`doc_library_*`) are described in
+`include/webui/webui_doc_library.h`; this section covers whose words a document holds.
+
+In `doc_library_list_response`, each row of a document the requester owns carries:
+- `outside`: where its text came from (`outside_kind_t`, `include/core/outside_kind.h`): `0` the
+  user's own words, `5` a document (every upload, attachment or saved text), `3` a research
+  report; a note written in a turn that read outside text carries that text's kind.
+- `own`: whether a chunk of it recalled into a turn counts as the user's own words: the user
+  vouched for it (`set_document_own`), or `outside` is 0 or 8.  A note starts own, anything else
+  not.  The panel's switch shows this value.  Rows of another user's document (a global one, or
+  the admin All Users view) carry neither, and show no switch.
+
+#### `set_document_own`
+Vouch for one of the user's documents as their own text, or take it back.  On sets the vouch and
+keeps `outside` as it is (a research report stays 3, an attachment 5).  Off clears the vouch, and
+an `outside` of 0 or 8 becomes 5 (the user says it isn't their words); any other kind stays.  So
+the response's `own` is the value asked for.  Only the document's owner can, from the panel: no
+tool action sets it.
+```json
+{"type": "set_document_own", "payload": {"document_id": 42, "own": true}}
+```
+Response:
+```json
+{"type": "set_document_own_response", "payload": {"document_id": 42, "own": true, "outside": 5}}
+```
+or `{"document_id": 42, "error": "..."}` (a missing field, or not the user's document).  A save,
+edit or append by the model in a turn that read outside text clears the vouch; the next list
+shows it.  A deleted document recovered comes back without it.
 
 ---
 
@@ -1165,6 +1574,10 @@ Control music playback.
     (index clamped into range); empty queue just re-echoes state
   - bare while **already playing** — re-echoes state (no-op)
 - Response: `music_state` (updated state)
+- `add_album` appends a whole album, in track order: `album_key` (from an `albums` browse)
+  plus `album` and `artist`, as the browse sent them. Keys change when the library is rescanned
+  or Plex syncs (each restart), so the server checks a key against `album` and otherwise looks
+  the album up by `album` and `artist`; a client may send those alone.
 
 #### `music_search`
 Search the music library.
@@ -1191,6 +1604,14 @@ Browse the music library (artists, albums, tracks).
 }
 ```
 Response: `music_library_response`
+
+Albums:
+- `type: "albums"` (with `offset`/`limit`) lists albums: an album artist plus an album name,
+  editions merged, with one entry for all its copies (formats, Plex). Each entry carries `key`
+  (a string id, valid until the next library rescan or Plex sync), `name`, `artist` and
+  `track_count`; `total_count` counts albums.
+- `type: "tracks_by_album"` returns an album's tracks in order (disc, track number), up to the
+  queue's size: `album_key`, or `album` (and optional `artist`) as for `add_album`.
 
 #### `music_queue`
 Manage the playback queue.
@@ -1779,12 +2200,30 @@ The answer reaches a client by **either** route: this frame (turn completes whil
 attached) or the message batch on attach (already-finished job). `complete` carries
 `final_message_id` to correlate the two.
 
+`stream_id` (unsigned integer) is the stream the reply was delivered on; 0 = none (a user
+message, a research report). It counts per session, so two sessions of one user on the same
+conversation can both have a stream N. `reasoning` (string) carries the reply's reasoning, and is
+present only when there is some. `session_id` (unsigned integer, the value the `session`
+frame sends) names the session whose turn wrote the row. It is present if and only if a non-job
+session's turn wrote the row (a typed or spoken WebUI message and its reply, a job result
+re-engaging a conversation a browser is viewing), and absent for a background job's answer (its
+stream reaches every viewer of the job), a detached re-engagement and a research report. A
+client that streamed a reply adopts `message_id` onto its bubble when `conversation_id` and
+`stream_id` match and, if `session_id` is present, it is the session the client was on when it
+streamed; a row naming another session is that session's reply and is drawn as one. With
+`session_id` absent, match on the first two alone.
+
 A user message sent from the WebUI is fanned out the same way (`"role": "user"`, its saved
 text) to every browser of its user. The copy sent to the connection that sent it also carries
 `client_ref` when the `text` frame had one (flag `turn_refs`), so that connection can match it
 to its turn even if its `transcript` echo was dropped. Other connections' copies don't carry it.
 A user message that asked about an attached email carries `email_ref` in every copy, the
 sender's included (its `transcript` echo doesn't: the sender shows the chip it attached).
+
+A reply the user stopped while it streamed (flag `stopped_replies_saved`) carries
+`stopped: true`, and `text` is what was saved of it. The sender adopts it like any reply and
+replaces its bubble's text with `text`: the bubble may hold a little more (text drawn after the
+saved point) or tags the saved row doesn't.
 
 ### Background-Job List Frames (Phase 2)
 
@@ -1804,7 +2243,8 @@ All three carry the same job object:
    "deliver_to": "telegram-main", "error": "..."
 }
 ```
-`deliver_to` and `error` are **omitted when empty**. `status` ∈ `queued` |
+`deliver_to` and `error` are **omitted when empty**. `kind` is present (`"coding"`)
+only on a coding job, whose open requests `coding_pending` fetches. `status` ∈ `queued` |
 `running` | `done` | `failed` | `interrupted` | `cancelled`; the first two are the
 active states — treat anything else as terminal so an unrecognized future status
 cannot pin a row in a client's active set forever.
@@ -1814,8 +2254,15 @@ Reply to `jobs_request`; sent on (re)connect. Replaces the client's whole active
 set. `truncated: true` means the server hit its row ceiling and any count derived
 from this set is a **lower bound** — it should not happen under any valid config.
 ```json
-{ "type": "jobs_snapshot", "payload": { "jobs": [ /* … */ ], "truncated": false } }
+{ "type": "jobs_snapshot", "payload": { "success": true, "jobs": [ /* … */ ], "truncated": false } }
 ```
+When the server can't read the set (a database or memory failure) it still answers,
+with `success: false`, an `error` sentence and no `jobs`:
+```json
+{ "type": "jobs_snapshot", "payload": { "success": false, "error": "Couldn't read your background jobs." } }
+```
+Keep the active set the client already has (replacing it with nothing would hide
+running jobs) and tell the user its counts may be stale.
 
 #### `job_update` — one job's lifecycle transition
 Pushed when a job enters the active set (spawn), changes state within it
@@ -1832,6 +2279,143 @@ clients treat terminal as a sink — that is what stops a stale frame from
 resurrecting a finished job — this flag is what tells them to release the mark. A
 tab that did not initiate the resume sees only this frame, so the signal has to be
 in the data rather than in frame ordering.
+
+#### `coding_pending_response`
+```json
+{
+   "type": "coding_pending_response",
+   "payload": {
+      "jobs": [
+         {
+            "job": 1977,
+            "agent": "Claude Code",
+            "model": "claude-sonnet-5",
+            "requests": [
+               { "request_id": 12, "kind": "permission", "line": "reach the host `downloads.arduino.cc`", "repo": "dawn" },
+               { "request_id": 13, "kind": "question", "line": "", "question": "Which branch?\nOptions: main / dev" }
+            ]
+         }
+      ]
+   }
+}
+```
+`line` is DAWN's checked wording (empty when DAWN can't show what is asked: offer Deny
+only); `repo` is present when allowing on the repo can be offered; `question` is the
+agent's question, its own words (show it as text, as theirs). A job with nothing
+open has `requests: []`. `agent` names what runs the job; `model` is the model its last
+run reported, absent before the first run (show "default"). A coding job's work happens
+in its agent, not on the conversation's model, so a client shows these in place of its
+model controls and doesn't send text into the job's conversation (follow-up work goes
+through the assistant: "follow up on job 1977: ...").
+
+#### `coding_view_response`
+`ok` with `result`, the gateway's answer as is, or `error`. For `changes`: `head`,
+`base`, `task_id` (the job's branch is `refs/agent/<task_id>` in the gateway's
+mirror), `files` ({`path`, `added`, `removed`, `to_check`, `why`}; `added`/`removed` null
+for a binary file; `to_check` true for a file to check before publishing, with its pattern's
+`why` when it has one; those first, at most 2000) with `files_total`, and `commits`
+({`hash`, `subject`, `merge`}, at most 100, always the whole job's), `base_name` (the
+base branch), `scope` (as applied: `all`, `since_push` or the full hash),
+`scope_commits` (hashes it covers), `scope_merge` (a merge commit's scope) with
+`merge_recorded` (its files are the conflicts the gateway recorded; false: an
+approximation, the files it changed beyond both sides), `since_push_available` (bool),
+`nothing_since_push` (asked for `since_push` with nothing since the push: shows all), and on a `since_push` file `includes_main` (main's
+changes from a merge are in its diff), plus `job_state`, DAWN's facts about the job (the
+viewer's Publish and Close buttons come only from these): `status`, `closed` (bool),
+`pr_url` (checked; absent when none), `unpublished_commits` (int, `-1` when unknown) and
+`published` (bool). For `file`: `path`, `view`, and `text` (a unified
+diff, or the file), or `too_large` (bytes), `binary` or `missing`. Paths, subjects
+and text are the agent's: show them as text, and show invisible and
+direction-changing characters (bidi controls, zero-width characters) visibly, since
+this is where the user checks the work before publishing it.
+```json
+{ "type": "coding_view_response", "payload": { "job": 42, "what": "file", "nonce": "v3", "ok": true, "result": { "path": "src/a.c", "view": "diff", "text": "@@ -1 +1 @@\n-a\n+b\n" } } }
+```
+
+#### `coding_publish_preview_response`
+`ok` with `preview`, or `error`. `preview`: `head` (full hash), `repo`, `branch`,
+`base`, `commits` (count listed) with `commits_more` (true: 100 or more), `files` (count
+listed) with `files_total`, `to_check` ({`path`, `why`}: files to check before publishing,
+`why` empty for none), `history_only` ({`path`, `to_check`, `why?`}, the gateway's as it is:
+paths changed by the job's commits but not in its final diff, public in the branch's
+history), `workflows` (true: the work changes `.github/workflows`, which the gateway's
+token can't push; offer no Publish), `pr_title` (the title the agent wrote when
+`pr_title_by_agent`, else the job's name), `pr_body` (exactly the description the
+gateway will send) with `pr_body_sha256`, `mentions` (@handles in it), `closes` (issues
+its closing keywords close on merge), `pr_footer` (what the gateway appends to a
+description the user writes), and `pr_url` (an open pull request the job already
+has; absent if none). The strings are raw, and the paths, title and description are the
+agent's: show them as text, with invisible and direction-changing characters visible.
+```json
+{
+   "type": "coding_publish_preview_response",
+   "payload": {
+      "job": 42, "nonce": "a1", "ok": true,
+      "preview": {
+         "head": "4f1c…", "repo": "owner/repo", "branch": "agent/42-fix", "base": "main",
+         "commits": 2, "commits_more": false, "files": 3, "files_total": 3,
+         "to_check": [], "history_only": [ { "path": "notes.txt", "to_check": false } ],
+         "workflows": false, "pr_title": "Fix the parser", "pr_title_by_agent": true, "pr_body": "…", "pr_body_sha256": "9a0b…",
+         "mentions": [], "closes": [ "#41" ]
+      }
+   }
+}
+```
+
+#### `coding_publish_response`
+`ok: true` with `message` (DAWN's line: what was pushed) and, when a pull request is
+open, `pr_url`; or `ok: false` with `error` (why it wasn't published).
+```json
+{ "type": "coding_publish_response", "payload": { "job": 42, "nonce": "a2", "ok": true, "message": "Published coding job #42 …", "pr_url": "https://github.com/owner/repo/pull/12" } }
+```
+
+#### `coding_close_response`
+`ok: true` with `closed` (bool) and `message`; when closing would delete unpublished
+work, `closed` is false and `needs_confirm`: {`commits`, `files` (with uncommitted
+changes), `branch`, `head` (`""` when there are no commits)} says what, to be sent back
+with `confirm: true`. A refusal is `ok: false` with `error`, and no `closed`.
+```json
+{ "type": "coding_close_response", "payload": { "job": 42, "nonce": "a3", "ok": true, "closed": false, "message": "Closing coding job #42 (\"Fix the parser\") deletes its 3 unpublished commits and 2 files with uncommitted changes; nothing else has them.", "needs_confirm": { "commits": 3, "files": 2, "branch": "agent/42-fix", "head": "4f1c…" } } }
+```
+
+#### `coding_grants_response`
+To every tab of the user. `grants` is absent (with `error`) when the gateway didn't
+answer; after a revoke, `revoked`, `ok` and `message` say how it went. Each grant:
+`kind` (`domain` or `tool`), `value` (as stored, control characters dropped, clipped:
+show as text), `checked` (false: DAWN can't read it as a host or tool name; still
+listed so it can be revoked), `repo` (absent: every repo).
+```json
+{
+   "type": "coding_grants_response",
+   "payload": {
+      "revoked": 4, "ok": true, "message": "Removed standing approval 4 (...).",
+      "grants": [ { "id": 3, "kind": "domain", "value": "pypi.org", "checked": true, "repo": "dawn" } ]
+   }
+}
+```
+
+#### `coding_reply_response`
+```json
+{
+   "type": "coding_reply_response",
+   "payload": { "job": 1977, "request_id": 12, "nonce": "c1x2y3-4", "ok": true, "message": "Allowed: coding job #1977 (...) may now reach the host `downloads.arduino.cc`, for this task only. The agent picks up again." }
+}
+```
+
+#### Coding job events
+A coding job's conversation carries `agent_step` (`gw`: `tool` with `tool`, `brief`;
+`progress` with `text`), `agent_request` (`gw`: `request` with `request_id`,
+`request_kind`, `line` (DAWN's checked wording, empty when it can't show it),
+`value`, `tool`, `input`; `reply` with `request_id`, `decision`; `blocked`;
+`input_required` with `request_ids`; after the job finished, `published` with
+`pushed`, `pr_url`; `merged` with `pr_url`, `unpublished` (newer commits not
+published); `closed` with `reason`: `user` or `merged`) and `agent_end` (`gw`:
+`completed`, `failed`, `cancelled`, with `summary`, `branch`, `commits`, `diffstat`,
+`uncommitted`, `to_check` with `to_check_count` (files to check before publishing, one per
+line: the path, then a tab and the reason when there is one; `protected` and
+`protected_count` from an older gateway), `error`, `cost_usd`; lists arrive joined by
+newlines). All of it is the agent's text except `line`: render it as text
+only (show `pr_url` only in GitHub's form, `https://github.com/<o>/<r>/pull/<n>`).
 
 #### `job_action_response`
 Result of a `job_action`. Sent on every outcome including refusal, so a client can
@@ -1859,6 +2443,10 @@ case. `next_before_*` are omitted on an empty page.
    }
 }
 ```
+`success` is `true` on a page. When the server can't read one it answers with
+`success: false`, an `error` sentence and none of the other fields
+(`{ "success": false, "error": "Couldn't read your finished jobs." }`): show the
+error and treat the list as incomplete; the same request may be sent again.
 
 #### `job_notification`
 A background job finished: a silent completion toast to the owner's browser
@@ -1952,6 +2540,43 @@ WebUI configuration (sent after session).
 - `protocol`, `features`: the protocol version and feature flags (see
   [Protocol version and feature flags](#protocol-version-and-feature-flags)).
 
+#### `turn_waiting`
+Flag `turn_wait`.  The turn this session just sent waits for another turn running on the same
+conversation, and later starts; sent to the waiting session's connection only.
+```json
+{"type": "turn_waiting",
+ "payload": {"conversation_id": 123, "client_ref": "17", "waiting": true,
+             "holder": "turn", "stop_after_ms": 5000}}
+```
+```json
+{"type": "turn_waiting",
+ "payload": {"conversation_id": 123, "client_ref": "17", "waiting": false}}
+```
+- `client_ref`: the waiting turn's, when it was sent with one (typed turns); voice turns have
+  none.
+- `holder`: what holds the conversation: `turn` (another tab or app of the user), `job` (a
+  background job's turn) or `channel` (a messaging channel's turn).
+- `stop_after_ms`: how long to show the wait before offering to stop the other reply
+  (`stop_other_reply`).
+- With `waiting: true` comes a `state` `thinking` whose `detail` says what it waits for (for
+  clients without the flag). `waiting: false` is followed by the turn's normal frames.
+- The other turn's rows arrive as `message_appended` meanwhile.
+- A reconnect while the turn waits doesn't send `turn_waiting` again; the turn's frames follow
+  when it starts.
+- A turn whose connection is gone keeps waiting for up to the daemon's stale-turn time
+  (`[jobs] max_runtime_sec`), then stops (`turn_unsent`).
+
+#### `turn_unsent`
+Flag `turn_wait`.  The turn stopped before its question was saved: while it waited (`cancel`,
+its connection gone past the stale-turn time, or the daemon shutting down), or after it started
+(a `cancel` meant for the turn before it can land here).  Followed by `state` `idle`.  A spoken
+turn gets it without `client_ref`.  Not sent for a turn the client didn't send (a background job's result
+re-engaging the conversation): that one is tried again later.
+```json
+{"type": "turn_unsent",
+ "payload": {"conversation_id": 123, "client_ref": "17", "text_saved": false}}
+```
+
 #### `state`
 State machine update.
 ```json
@@ -2007,12 +2632,16 @@ Error or informational notification.
   each refusal is one frame.
 - `client_ref`: on an error raised for a `text` turn that carried one (flag `turn_refs`), the
   same string, unchanged; absent otherwise.
+- `request_type`, `req`: on an error sent while a message from this connection is being
+  handled (flag `request_refs`): the message's `type`, and its payload's `req` when it had
+  one, each only when it is at most 64 bytes of valid UTF-8 with no control characters. An
+  error raised later (a turn failing as it runs) or for no message has neither. An error is
+  sent at once, so it can arrive before replies to earlier requests: match it by `req`, not
+  by order.
 - A message whose `type` this daemon doesn't handle (older daemon, or a feature not compiled
   in) is answered with `UNKNOWN_TYPE`, severity `"error"`, so a client can fail at once instead
-  of waiting out its timeout. The frame carries `request_type` (the type sent) and `req` (the
-  payload's `req`), each only when it is at most 64 bytes of valid UTF-8 with no control
-  characters. Daemons before this answer nothing; no feature flag marks it. The error is sent
-  at once, so it can arrive before replies to earlier requests: match it by `req`, not by order.
+  of waiting out its timeout. It carries `request_type` and `req` as above, and did before
+  `request_refs`. Daemons before `UNKNOWN_TYPE` answer nothing; no feature flag marks it.
 
 #### `force_logout`
 This connection's login ended: a logout (from this or another tab), a login over it
@@ -2089,10 +2718,16 @@ End of LLM token stream.
    "type": "stream_end",
    "payload": {
       "stream_id": 1,
-      "reason": "complete|cancelled|error"
+      "reason": "complete|stopped|error|transient_error|tool_iteration",
+      "will_persist": true
    }
 }
 ```
+`will_persist` is present only when the daemon will save the reply's row (it then arrives as
+`message_appended`); the client doesn't save it.
+`"stopped"` (flag `stopped_replies_saved`): the user's Stop ended the reply. With
+`will_persist: true`, what had streamed is saved and arrives as `message_appended` with
+`stopped: true`; without it, nothing of the reply was saved.
 
 ---
 
@@ -2307,12 +2942,20 @@ Proactive LLM configuration update (sent when session config changes).
       "type": "cloud",
       "provider": "claude",
       "model": "claude-sonnet-4-5",
+      "follows_default": false,
       "openai_available": true,
       "claude_available": true,
-      "gemini_available": false
+      "gemini_available": false,
+      "openrouter_available": false
    }
 }
 ```
+- `follows_default`: true when the conversation has no model of its own (it follows the
+  dawn.toml default); a client offers "Use the default" only when it is false, sending
+  `set_session_llm` `{"type": "reset"}` without `from_restore`, which saves the
+  conversation as following the default
+- `*_available`: whether that provider has an API key, for showing which can be picked
+  (a provider without one is listed as "(no API key)"); never a choice made for the user
 
 ---
 
@@ -2406,6 +3049,11 @@ conversation per daemon run.  `message` is DAWN's own plain-language text (show 
 ```
 The conversation isn't named (it may be another user's, or private); the daemon log's
 `LLM binding` line names it.
+
+#### `memory_batch`
+A consolidation batch recorded, undone, kept from, or changed by a forget: the batch object, to every
+browser tab of the user; one a forget removed: `{"batch_id", "removed": true}`. See Memory
+Management, Consolidation.
 
 #### `memory_proposals_changed`
 The count of pending memory proposals changed (signal to refresh a proposals view).
@@ -2598,6 +3246,18 @@ returns at once with `queued: true` and this follows when the sync ends, to the 
 { "type": "calendar_sync_done", "payload": { "id": 3, "success": true } }
 ```
 
+#### `conversation_renamed`
+A conversation's title changed: the daemon titled it after its first exchange, or the user
+renamed it from any client (`rename_conversation`; sent for a manual rename since 2026-11-17,
+before that only for the daemon's own title).  Sent to every client of the owning user, the
+renaming one included; that client may get it before its `rename_conversation_response`, so
+don't rely on their order.
+```json
+{ "type": "conversation_renamed", "payload": { "conversation_id": 1234, "title": "Trip planning" } }
+```
+Update the title wherever the client shows it: the conversation list, an open conversation's
+header, a memory batch's `conversation_title`.
+
 #### `conversation_list_changed`
 The user's conversation list changed — a conversation was **created** or its
 last-activity was **bumped** — from any interface (a second browser tab, a messaging
@@ -2672,6 +3332,7 @@ Satellites also receive the same streaming messages as WebUI clients:
 | Request | Response |
 |---------|----------|
 | `get_config` | `get_config_response` |
+| `stop_other_reply` | `stop_other_reply_response` |
 | `email_list_accounts` | `email_list_accounts_response` |
 | `email_add_account` | `email_add_account_response` |
 | `email_update_account` | `email_update_account_response` |
@@ -2694,7 +3355,6 @@ Satellites also receive the same streaming messages as WebUI clients:
 | `list_interfaces` | `list_interfaces_response` |
 | `list_llm_models` | `list_llm_models_response` |
 | `restart` | `restart_response` |
-| `set_llm_runtime` | `set_llm_runtime_response` |
 | `set_session_llm` | `set_session_llm_response` |
 | `get_system_prompt` | `system_prompt_response` |
 | `get_tools_config` | `get_tools_config_response` |
@@ -2728,11 +3388,16 @@ Satellites also receive the same streaming messages as WebUI clients:
 | `get_memory_stats` | `get_memory_stats_response` |
 | `list_memory_facts` | `list_memory_facts_response` |
 | `search_memory` | `search_memory_response` |
+| `list_memory_entities` | `list_memory_entities_response` |
 | `get_memory_fact_source` | `get_memory_fact_source_response` |
 | `delete_memory_fact` | `delete_memory_fact_response` |
 | `delete_all_memories` | `delete_all_memories_response` |
 | `list_memory_superseded` | `list_memory_superseded_response` |
 | `restore_memory_fact` | `restore_memory_fact_response` |
+| `list_memory_batches` | `list_memory_batches_response` |
+| `undo_memory_batch` | `undo_memory_batch_response` (when the worker ends) |
+| `keep_memory_op` | `keep_memory_op_response` (when the worker ends) |
+| `set_document_own` | `set_document_own_response` |
 | `music_subscribe` | `music_state` |
 | `music_control` | `music_state` |
 | `music_search` | `music_search_response` |
@@ -2781,6 +3446,7 @@ All `*_response` messages follow a common pattern:
 | `src/webui/webui_email_panel.c` | The mail panel's verbs (list, search, read, flags, counts) |
 | `src/webui/webui_email_exec.c` | Email work off the socket thread, one task per account |
 | `src/webui/webui_memory.c` | Memory facts, preferences, summaries |
+| `src/webui/webui_memory_batches.c` | What memory learned per batch: list, undo, keep (the Learned tab, the marker) |
 | `src/webui/webui_admin.c` | User management (CRUD, unlock) |
 | `src/webui/webui_session.c` | Session list and revocation |
 | `src/webui/webui_settings.c` | Personal user settings |

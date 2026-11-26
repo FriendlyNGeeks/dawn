@@ -33,10 +33,12 @@
 
 #include "auth/auth_db.h"
 #include "config/dawn_config.h"
+#include "core/conv_turn_lease.h"
 #include "core/focus/focus_handles.h"
 #include "core/focus/focus_incremental.h"
 #include "core/session_compaction.h"
 #include "core/session_focus.h"
+#include "core/session_posts.h"
 #include "core/session_prefix.h"
 #include "core/session_reaper.h"
 #include "core/tool_result_store.h"
@@ -45,6 +47,7 @@
 #include "llm/llm_command_parser.h"
 #include "llm/llm_history_kind.h"
 #include "llm/llm_interface.h"
+#include "llm/llm_selection.h"
 #include "llm/llm_tools.h"
 #include "llm/llm_turn_blocks.h"
 #include "logging.h"
@@ -100,11 +103,8 @@ __attribute__((weak)) void webui_send_purge_session(const session_t *s) {
  */
 static __thread session_t *tl_command_context = NULL;
 
-/* The running turn this thread works for (see session_turn_token()), and LLM
- * settings pinned for work that outlives its turn. */
+/* The running turn this thread works for (see session_turn_token()). */
 static __thread uint64_t tl_turn_token = 0;
-static __thread const session_t *tl_llm_override_session = NULL;
-static __thread const session_llm_config_t *tl_llm_override = NULL;
 
 // =============================================================================
 // Internal Helper Functions
@@ -269,6 +269,14 @@ static session_t *session_alloc(void) {
 static void session_free(session_t *session) {
    if (!session) {
       return;
+   }
+
+   /* No thread runs its turn by now, so a conversation it still holds would
+    * never be released: a turn exit that skipped its end. */
+   const int stray_leases = conv_turn_lease_release_session(session->session_id);
+   if (stray_leases > 0) {
+      OLOG_ERROR("Session %u: freed while holding %d conversation lease(s); released",
+                 session->session_id, stray_leases);
    }
 
    /* Its compaction first: a worker still summarizing (shutdown frees without
@@ -1619,6 +1627,10 @@ static char *turn_note_with_email(session_t *session, const char *note) {
 }
 
 static int dispatch_with_note(session_t *session, const char *user_turn_text, const char *note);
+static int dispatch_prompt(session_t *session,
+                           const char *user_turn_text,
+                           const char *turn_note,
+                           int user_id);
 
 int session_dispatch_user_turn_ex(session_t *session,
                                   const char *user_turn_text,
@@ -1648,6 +1660,45 @@ static int dispatch_with_note(session_t *session,
     * triggered on first content) and could wipe a mid-turn held-back partial. */
    text_filter_cited_reset(&session->cited_tag_filter);
 
+   /* Re-read user_id under metrics_mutex so satellite rebinds that
+    * occurred since last turn are picked up.  A guest (0: an unmapped
+    * satellite, a local mic with no voice user) gets the base prompt, its
+    * surface's standing directions and the time; the builder adds nothing of
+    * any user's (settings, memory, retrieval are gated on a user). */
+   const int user_id = session_effective_user_id(session);
+
+   /* What DAWN posted into the conversation since (a job's report): told with
+    * this turn's note, so the turn's sizing below counts it. */
+   char *posts = session_posts_take(session, user_id);
+   char *joined = NULL;
+   if (posts != NULL && turn_note == NULL) {
+      joined = posts; /* the note is the posts */
+      turn_note = joined;
+   } else if (posts != NULL) {
+      const size_t len = strlen(turn_note) + 2 + strlen(posts) + 1;
+      joined = malloc(len);
+      if (joined != NULL) {
+         snprintf(joined, len, "%s\n\n%s", turn_note, posts);
+         turn_note = joined;
+      } else {
+         /* Not told after all: the next turn tells them. */
+         pthread_mutex_lock(&session->history_mutex);
+         session_posts_untell_locked(session);
+         pthread_mutex_unlock(&session->history_mutex);
+      }
+      free(posts);
+   }
+   const int rc = dispatch_prompt(session, user_turn_text, turn_note, user_id);
+   free(joined);
+   return rc;
+}
+
+/* dispatch_with_note()'s build: the turn's prompt and context, @p turn_note
+ * with what it was told. */
+static int dispatch_prompt(session_t *session,
+                           const char *user_turn_text,
+                           const char *turn_note,
+                           int user_id) {
    session_prompt_builder_t builder = atomic_load_explicit(&s_prompt_builder, memory_order_acquire);
    if (builder == NULL) {
       /* No builder (a build without one): the base prompt is what a new
@@ -1658,13 +1709,6 @@ static int dispatch_with_note(session_t *session,
       composed_prompt_free(&base);
       return SUCCESS;
    }
-
-   /* Re-read user_id under metrics_mutex so satellite rebinds that
-    * occurred since last turn are picked up.  A guest (0: an unmapped
-    * satellite, a local mic with no voice user) gets the base prompt, its
-    * surface's standing directions and the time; the builder adds nothing of
-    * any user's (settings, memory, retrieval are gated on a user). */
-   const int user_id = session_effective_user_id(session);
 
    composed_prompt_t cp = { 0 };
    if (builder(session, user_id, user_turn_text, &cp) != SUCCESS) {
@@ -1700,40 +1744,6 @@ static int dispatch_with_note(session_t *session,
 // Per-Session LLM Configuration
 // =============================================================================
 
-/* @p config, or a copy in @p fallback with a cloud provider that has an API key
- * when @p config's doesn't; NULL when no cloud provider has one. */
-static const session_llm_config_t *usable_llm_config(const session_t *session,
-                                                     const session_llm_config_t *config,
-                                                     session_llm_config_t *fallback) {
-   if (config->type != LLM_CLOUD) {
-      return config;
-   }
-   bool has_key = false;
-   if (config->cloud_provider == CLOUD_PROVIDER_OPENAI)
-      has_key = llm_has_openai_key();
-   else if (config->cloud_provider == CLOUD_PROVIDER_CLAUDE)
-      has_key = llm_has_claude_key();
-   else if (config->cloud_provider == CLOUD_PROVIDER_GEMINI)
-      has_key = llm_has_gemini_key();
-   else if (config->cloud_provider == CLOUD_PROVIDER_OPENROUTER)
-      has_key = llm_has_openrouter_key();
-   if (has_key) {
-      return config;
-   }
-
-   cloud_provider_t alt = llm_detect_available_provider();
-   if (alt == CLOUD_PROVIDER_NONE) {
-      OLOG_WARNING("Session %u: No cloud provider has an API key configured", session->session_id);
-      return NULL;
-   }
-   OLOG_INFO("Session %u: %s provider unavailable, falling back to %s", session->session_id,
-             cloud_provider_to_string(config->cloud_provider), cloud_provider_to_string(alt));
-   memcpy(fallback, config, sizeof(session_llm_config_t));
-   fallback->cloud_provider = alt;
-   fallback->model[0] = '\0'; /* Clear model — let resolver pick default for new provider */
-   return fallback;
-}
-
 /* Caller holds llm_config_mutex.  True for the running turn's own code: its
  * thread and the tool threads carrying its token. */
 static bool is_turn_caller_locked(const session_t *session) {
@@ -1744,20 +1754,18 @@ int session_set_llm_config(session_t *session, const session_llm_config_t *confi
    if (!session || !config) {
       return 1;
    }
-   session_llm_config_t fallback_config;
-   config = usable_llm_config(session, config, &fallback_config);
-   if (!config) {
-      return 1;
-   }
 
    /* A turn changing its own settings (switch_llm): the turn's settings change;
     * the session's only when the turn runs on the session's live history, i.e.
     * on the conversation being viewed. */
    const bool on_own_copy = session_turn_on_own_history(session);
+   /* A turn runs on a concrete selection; the session's may stay unset. */
+   session_llm_config_t turn_cfg = *config;
+   llm_selection_resolve(&turn_cfg); /* takes g_config_rwlock: outside the session's mutex */
    pthread_mutex_lock(&session->llm_config_mutex);
    const bool turn_caller = is_turn_caller_locked(session);
    if (turn_caller) {
-      memcpy(&session->turn_llm_config, config, sizeof(session_llm_config_t));
+      session->turn_llm_config = turn_cfg;
    }
    if (!turn_caller || !on_own_copy) {
       memcpy(&session->llm_config, config, sizeof(session_llm_config_t));
@@ -1774,15 +1782,12 @@ int session_set_turn_llm_config(session_t *session, const session_llm_config_t *
    if (!session || !config) {
       return 1;
    }
-   session_llm_config_t fallback_config;
-   config = usable_llm_config(session, config, &fallback_config);
-   if (!config) {
-      return 1;
-   }
+   session_llm_config_t turn_cfg = *config;
+   llm_selection_resolve(&turn_cfg); /* outside the session's mutex */
    pthread_mutex_lock(&session->llm_config_mutex);
    const bool turn_caller = is_turn_caller_locked(session);
    if (turn_caller) {
-      memcpy(&session->turn_llm_config, config, sizeof(session_llm_config_t));
+      session->turn_llm_config = turn_cfg;
    }
    pthread_mutex_unlock(&session->llm_config_mutex);
    if (!turn_caller) {
@@ -1799,11 +1804,15 @@ void session_get_llm_config(session_t *session, session_llm_config_t *config) {
    if (!session || !config) {
       return;
    }
+   session_get_llm_config_raw(session, config);
+   llm_selection_resolve(config); /* takes g_config_rwlock: outside the session's mutex */
+}
 
-   if (tl_llm_override && tl_llm_override_session == session) {
-      memcpy(config, tl_llm_override, sizeof(session_llm_config_t));
+void session_get_llm_config_raw(session_t *session, session_llm_config_t *config) {
+   if (!session || !config) {
       return;
    }
+
    pthread_mutex_lock(&session->llm_config_mutex);
    if (session->turn_llm_config_set && tl_turn_token != 0 && tl_turn_token == session->turn_gen) {
       /* Part of the running turn: its own settings (see session_t.turn_llm_config). */
@@ -1812,6 +1821,25 @@ void session_get_llm_config(session_t *session, session_llm_config_t *config) {
       memcpy(config, &session->llm_config, sizeof(session_llm_config_t));
    }
    pthread_mutex_unlock(&session->llm_config_mutex);
+}
+
+bool session_llm_follows_default(session_t *session) {
+   if (!session) {
+      return true;
+   }
+   /* The session's own selection, never a running turn's (always concrete), so a
+    * conversation first saved during a turn isn't stamped with the default's
+    * values as if they were a pick. */
+   pthread_mutex_lock(&session->llm_config_mutex);
+   const bool follows = session->llm_config.type == LLM_UNDEFINED;
+   pthread_mutex_unlock(&session->llm_config_mutex);
+   return follows;
+}
+
+int session_turn_selection_problem(session_t *session, char *reason, size_t reason_len) {
+   session_llm_config_t cfg;
+   session_get_llm_config(session, &cfg);
+   return llm_selection_problem(session ? &cfg : NULL, reason, reason_len);
 }
 
 // =============================================================================
@@ -1897,10 +1925,6 @@ void session_set_turn_token(uint64_t token) {
    tl_turn_token = token;
 }
 
-void session_set_llm_config_override(const session_t *session, const session_llm_config_t *config) {
-   tl_llm_override_session = config ? session : NULL;
-   tl_llm_override = session ? config : NULL;
-}
 
 // =============================================================================
 // Per-Session Metrics

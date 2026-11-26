@@ -1236,6 +1236,8 @@ json_object *config_to_json(const dawn_config_t *config) {
    json_object *llm = json_object_new_object();
    json_object_object_add(llm, "type", json_object_new_string(config->llm.type));
    json_object_object_add(llm, "max_tokens", json_object_new_int(config->llm.max_tokens));
+   json_object_object_add(llm, "local_fallback",
+                          json_object_new_boolean(config->llm.local_fallback));
 
    /* [llm.cloud] */
    json_object *cloud = json_object_new_object();
@@ -1391,6 +1393,9 @@ json_object *config_to_json(const dawn_config_t *config) {
       json_object_object_add(s, "idle_close_seconds", json_object_new_int(srv->idle_close_seconds));
       json_object_object_add(s, "tls_verify", json_object_new_boolean(srv->tls_verify));
       json_object_object_add(s, "auth_bearer_env", json_object_new_string(srv->auth_bearer_env));
+      json_object_object_add(s, "auth_bearer_token_secret",
+                             json_object_new_string(srv->auth_bearer_token_secret));
+      json_object_object_add(s, "role", json_object_new_string(srv->role));
       json_object_array_add(mcp_servers, s);
    }
    json_object_object_add(mcp, "servers", mcp_servers);
@@ -2001,6 +2006,16 @@ json_object *secrets_to_json_status(const secrets_config_t *secrets) {
    json_object_object_add(obj, "slack_bot_token",
                           json_object_new_boolean(secrets && secrets->slack_bot_token[0]));
 
+   /* [secrets.mcp]: the names that have a token, never the tokens. */
+   json_object *mcp = json_object_new_array();
+   if (mcp) {
+      for (int i = 0; secrets && i < secrets->mcp_count && i < MCP_SECRETS_MAX; i++) {
+         if (secrets->mcp[i].token[0]) {
+            json_object_array_add(mcp, json_object_new_string(secrets->mcp[i].name));
+         }
+      }
+      json_object_object_add(obj, "mcp", mcp);
+   }
    return obj;
 }
 
@@ -2237,6 +2252,7 @@ int config_write_toml(const dawn_config_t *config, const char *path) {
    fprintf(fp, "\n[llm]\n");
    write_toml_string(fp, "type", config->llm.type);
    fprintf(fp, "max_tokens = %d\n", config->llm.max_tokens);
+   fprintf(fp, "local_fallback = %s\n", config->llm.local_fallback ? "true" : "false");
    fprintf(fp, "compact_soft_threshold = %.2f\n", config->llm.compact_soft_threshold);
    fprintf(fp, "compact_hard_threshold = %.2f\n", config->llm.compact_hard_threshold);
    fprintf(fp, "compact_use_session = %s\n", config->llm.compact_use_session ? "true" : "false");
@@ -2809,6 +2825,9 @@ int config_write_toml(const dawn_config_t *config, const char *path) {
       if (srv->auth_bearer_token_secret[0] != '\0') {
          write_toml_string(fp, "auth_bearer_token_secret", srv->auth_bearer_token_secret);
       }
+      if (srv->role[0] != '\0') {
+         write_toml_string(fp, "role", srv->role);
+      }
    }
 
    /* [code_projects] (coding harness) — round-trips. allowed_host_pattern is a
@@ -2860,6 +2879,11 @@ int secrets_write_toml(const secrets_config_t *secrets, const char *path) {
       OLOG_ERROR("Failed to open secrets file for writing: %s (%s)", path, strerror(errno));
       return 1;
    }
+   /* open() applies 0600 only to a new file: tighten an existing one too. */
+   if (fchmod(fd, 0600) != 0) {
+      OLOG_WARNING("Could not set %s to mode 600: %s", path, strerror(errno));
+   }
+
    FILE *fp = fdopen(fd, "w");
    if (!fp) {
       OLOG_ERROR("Failed to fdopen secrets file: %s (%s)", path, strerror(errno));
@@ -2931,6 +2955,14 @@ int secrets_write_toml(const secrets_config_t *secrets, const char *path) {
       WRITE_SECRET("client_id", secrets->schwab_client_id);
       WRITE_SECRET("client_secret", secrets->schwab_client_secret);
       WRITE_SECRET("redirect_url", secrets->schwab_redirect_url);
+   }
+
+   /* Names were checked as bare TOML keys when parsed. */
+   if (secrets->mcp_count > 0) {
+      fprintf(fp, "\n[secrets.mcp]\n");
+      for (int i = 0; i < secrets->mcp_count && i < MCP_SECRETS_MAX; i++) {
+         WRITE_SECRET(secrets->mcp[i].name, secrets->mcp[i].token);
+      }
    }
 
 #undef WRITE_SECRET

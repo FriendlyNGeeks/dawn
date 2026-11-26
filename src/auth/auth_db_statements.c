@@ -242,7 +242,7 @@ static const auth_db_stmt_def_t s_stmts[] = {
      &s_db.stmt_event_append },
    { "msg_get",
      "SELECT m.id, m.conversation_id, m.role, m.content, m.tool_calls, m.tool_call_id, "
-     "m.reasoning, m.created_at, m.is_error, " CONV_MSG_EMAIL_REF_COL(
+     "m.reasoning, m.created_at, m.is_error, " CONV_MSG_EMAIL_REF_COL(m) ", " CONV_MSG_STOPPED_COL(
          m) " FROM messages m "
             "INNER JOIN conversations c ON m.conversation_id = c.id "
             "WHERE m.conversation_id = ? AND c.user_id = ? AND m.kind IS NULL ORDER BY m.id ASC",
@@ -253,7 +253,7 @@ static const auth_db_stmt_def_t s_stmts[] = {
     * reasoning rehydration works identically to the unbounded load. */
    { "msg_get_after",
      "SELECT m.id, m.conversation_id, m.role, m.content, m.tool_calls, m.tool_call_id, "
-     "m.reasoning, m.created_at, m.is_error, " CONV_MSG_EMAIL_REF_COL(
+     "m.reasoning, m.created_at, m.is_error, " CONV_MSG_EMAIL_REF_COL(m) ", " CONV_MSG_STOPPED_COL(
          m) " FROM messages m "
             "INNER JOIN conversations c ON m.conversation_id = c.id "
             "WHERE m.conversation_id = ? AND c.user_id = ? AND m.id > ? AND m.kind IS NULL "
@@ -264,9 +264,10 @@ static const auth_db_stmt_def_t s_stmts[] = {
    { "msg_get_admin",
      "SELECT id, conversation_id, role, content, tool_calls, tool_call_id, "
      "reasoning, created_at, "
-     "is_error, " CONV_MSG_EMAIL_REF_COL(messages) " FROM messages WHERE conversation_id = ? "
-                                                   "AND kind IS NULL "
-                                                   "ORDER BY id ASC",
+     "is_error, " CONV_MSG_EMAIL_REF_COL(messages) ", " CONV_MSG_STOPPED_COL(
+         messages) " FROM messages WHERE conversation_id = ? "
+                   "AND kind IS NULL "
+                   "ORDER BY id ASC",
      &s_db.stmt_msg_get_admin },
    { "conv_update_meta",
      "UPDATE conversations SET updated_at = ?, message_count = message_count + 1 WHERE id = ?",
@@ -794,10 +795,16 @@ static const auth_db_stmt_def_t s_stmts[] = {
     * re-querying MAX(id) at commit time — avoids TOCTOU when new messages arrive
     * during LLM inference.  CASE guard preserves the existing cursor when the
     * caller passes 0 (early-skip paths with no prov). */
-   /* A cursor advance carries what the rows it passes read: ?4 raises the
+   /* An advance counts the rows it passes, in message_count's units (request
+    * context never counted): a caller's history may hold fewer rows than the
+    * conversation, and memory recovery picks a conversation by the count.
+    * ?1 stands only when the cursor stays.
+    * A cursor advance carries what the rows it passes read: ?4 raises the
     * outside floor when tainted and the floor isn't yet (the first sticks). */
    { "conv_set_last_extracted",
-     "UPDATE conversations SET last_extracted_msg_count = ?1, "
+     "UPDATE conversations SET last_extracted_msg_count = CASE WHEN ?2 > 0 THEN "
+     "(SELECT COUNT(*) FROM messages WHERE conversation_id = ?3 AND kind IS NULL "
+     "AND id <= ?2) ELSE ?1 END, "
      "last_extracted_msg_id = CASE WHEN ?2 > 0 THEN ?2 ELSE last_extracted_msg_id END, "
      "extraction_attempts = 0, extraction_last_attempt_at = 0, "
      "outside = CASE WHEN ?4 NOT IN (" OUTSIDE_UNTAINTED_SQL
@@ -1143,13 +1150,15 @@ static const auth_db_stmt_def_t s_stmts[] = {
 
    /* Document search statements */
    { "doc_create",
+     /* outside: a note is the user's words (NONE); anything else is DOCUMENT
+      * (the user may vouch for it as their own: document_db_set_own). */
      "INSERT INTO documents (user_id, filename, filepath, filetype, file_hash, "
-     "num_chunks, is_global, created_at, original_blob_id) "
-     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+     "num_chunks, is_global, created_at, original_blob_id, outside) "
+     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ?4 = 'note' THEN 0 ELSE 5 END)",
      &s_db.stmt_doc_create },
    { "doc_get",
      "SELECT id, user_id, filename, filepath, filetype, file_hash, "
-     "num_chunks, is_global, created_at FROM documents WHERE id = ?",
+     "num_chunks, is_global, created_at, outside, own FROM documents WHERE id = ?",
      &s_db.stmt_doc_get },
    { "doc_get_by_hash",
      "SELECT id FROM documents WHERE file_hash = ? "
@@ -1157,13 +1166,13 @@ static const auth_db_stmt_def_t s_stmts[] = {
      &s_db.stmt_doc_get_by_hash },
    { "doc_list",
      "SELECT id, user_id, filename, filepath, filetype, file_hash, "
-     "num_chunks, is_global, created_at FROM documents "
+     "num_chunks, is_global, created_at, outside, own FROM documents "
      "WHERE user_id = ? OR is_global = 1 ORDER BY created_at DESC "
      "LIMIT ? OFFSET ?",
      &s_db.stmt_doc_list },
    { "doc_list_all",
      "SELECT d.id, d.user_id, d.filename, d.filepath, d.filetype, "
-     "d.file_hash, d.num_chunks, d.is_global, d.created_at, "
+     "d.file_hash, d.num_chunks, d.is_global, d.created_at, d.outside, d.own, "
      "COALESCE(u.username, '') FROM documents d "
      "LEFT JOIN users u ON d.user_id = u.id "
      "ORDER BY d.created_at DESC LIMIT ? OFFSET ?",
@@ -1182,7 +1191,7 @@ static const auth_db_stmt_def_t s_stmts[] = {
      &s_db.stmt_doc_chunk_create },
    { "doc_find_by_name",
      "SELECT id, user_id, filename, filepath, filetype, file_hash, "
-     "num_chunks, is_global, created_at "
+     "num_chunks, is_global, created_at, outside, own "
      "FROM documents "
      "WHERE (user_id = ? OR is_global = 1) "
      "AND filename LIKE ? ESCAPE '\\' COLLATE NOCASE "
@@ -1210,18 +1219,24 @@ static const auth_db_stmt_def_t s_stmts[] = {
     * case-sensitive uses instr() (literal, no escaping). LIMIT is bound to page+1
     * so the caller can detect "more matches exist" without a COUNT. */
    { "doc_chunk_grep_ci",
-     "SELECT c.chunk_index, c.document_id, d.filename, d.num_chunks "
-     "FROM document_chunks c JOIN documents d ON c.document_id = d.id "
-     "WHERE (d.user_id = ? OR d.is_global = 1) "
-     "AND c.text LIKE ? ESCAPE '\\' "
-     "ORDER BY c.document_id, c.chunk_index LIMIT ? OFFSET ?",
+     "SELECT c.chunk_index, c.document_id, d.filename, d.num_chunks, "
+     "d.user_id = ?1 AND " OUTSIDE_OWN_SQL(
+         "d.own",
+         "d.outside") " "
+                      "FROM document_chunks c JOIN documents d ON c.document_id = d.id "
+                      "WHERE (d.user_id = ?1 OR d.is_global = 1) "
+                      "AND c.text LIKE ?2 ESCAPE '\\' "
+                      "ORDER BY c.document_id, c.chunk_index LIMIT ?3 OFFSET ?4",
      &s_db.stmt_doc_chunk_grep_ci },
    { "doc_chunk_grep_cs",
-     "SELECT c.chunk_index, c.document_id, d.filename, d.num_chunks "
-     "FROM document_chunks c JOIN documents d ON c.document_id = d.id "
-     "WHERE (d.user_id = ? OR d.is_global = 1) "
-     "AND instr(c.text, ?) > 0 "
-     "ORDER BY c.document_id, c.chunk_index LIMIT ? OFFSET ?",
+     "SELECT c.chunk_index, c.document_id, d.filename, d.num_chunks, "
+     "d.user_id = ?1 AND " OUTSIDE_OWN_SQL(
+         "d.own",
+         "d.outside") " "
+                      "FROM document_chunks c JOIN documents d ON c.document_id = d.id "
+                      "WHERE (d.user_id = ?1 OR d.is_global = 1) "
+                      "AND instr(c.text, ?2) > 0 "
+                      "ORDER BY c.document_id, c.chunk_index LIMIT ?3 OFFSET ?4",
      &s_db.stmt_doc_chunk_grep_cs },
 
    /* === v61: document_chunks_fts (BM25 lexical channel) ===

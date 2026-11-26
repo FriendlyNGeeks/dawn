@@ -106,7 +106,7 @@ See [GETTING_STARTED.md — Automated Install](../GETTING_STARTED.md#automated-i
 ### Build tools
 
 ```bash
-sudo apt install cmake build-essential pkg-config
+sudo apt install cmake build-essential pkg-config wget unzip
 ```
 
 ### Core libraries
@@ -175,12 +175,14 @@ ONNX Runtime is required for TTS (Piper), VAD (Silero), and the embedding engine
 > **Have an NVIDIA GPU?** If you want GPU-accelerated Whisper ASR, build ONNX Runtime from source with CUDA instead. See [GETTING_STARTED.md — Option B](../GETTING_STARTED.md#step-3-install-onnx-runtime) for build instructions. The install script (`scripts/install.sh`) detects CUDA automatically and handles the source build, including the GCC 14 workaround.
 
 ```bash
-wget https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
-tar xzf onnxruntime-linux-x64-1.22.0.tgz
-
-# Install headers (note: -r is required for the core/ subdirectory)
-sudo cp -r onnxruntime-linux-x64-1.22.0/include/* /usr/local/include/
-sudo cp -a onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so* /usr/local/lib/
+# Microsoft's NuGet package carries the Linux libraries and headers
+wget https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.22.0/microsoft.ml.onnxruntime.1.22.0.nupkg
+unzip -q microsoft.ml.onnxruntime.1.22.0.nupkg -d ort "runtimes/linux-x64/native/*" "build/native/include/*"
+sudo cp ort/runtimes/linux-x64/native/libonnxruntime.so /usr/local/lib/libonnxruntime.so.1.22.0
+sudo cp ort/runtimes/linux-x64/native/libonnxruntime_providers_shared.so /usr/local/lib/
+sudo ln -sf libonnxruntime.so.1.22.0 /usr/local/lib/libonnxruntime.so.1
+sudo ln -sf libonnxruntime.so.1 /usr/local/lib/libonnxruntime.so
+sudo cp -r ort/build/native/include/* /usr/local/include/
 sudo ldconfig
 ```
 
@@ -377,13 +379,14 @@ claude_api_key = "sk-ant-..."
 # gemini_api_key = "..."
 ```
 
-The cloud LLM provider is auto-detected from available keys (Claude > OpenAI > Gemini).
-You can override with `[llm.cloud] provider = "claude"` in `dawn.toml`.
+For chat, a key is used only for the provider `dawn.toml` selects: set `[llm.cloud] provider = "claude"`
+(or `"openai"`, `"gemini"`, `"openrouter"`), or pick it in Settings → Language Model. With no
+provider selected, DAWN uses the local LLM (`[llm.local]`).
 
-### dawn.toml (optional)
+### dawn.toml
 
-DAWN works with sensible defaults. A `dawn.toml` is only needed to customize settings.
-Key settings for server mode:
+DAWN works with sensible defaults; for a cloud LLM, `dawn.toml` (or Settings) must name the
+provider. Key settings for server mode:
 
 ```toml
 [general]
@@ -400,6 +403,9 @@ ssl_key_path = "ssl/dawn.key"
 
 [llm]
 type = "cloud"
+
+[llm.cloud]
+provider = "claude"   # the provider whose key is in secrets.toml
 
 [mqtt]
 enabled = true
@@ -511,9 +517,10 @@ setup guide — the common ones:
 ### Cloud LLM not working
 
 - Check `secrets.toml` has the correct API key
-- Provider is auto-detected; if `dawn.toml` specifies a provider without a key, it falls
-  back to the first available provider
-- Check server logs for `Cloud provider auto-detected: Claude` (or similar)
+- `[llm.cloud] provider` must name the provider whose key you added; DAWN never picks
+  one from the keys. A provider with no key is refused, and the reply says so
+- The startup log names the LLM it will use: `Default LLM: cloud (claude)`, or the reason it
+  can't run
 
 ### Whisper slow (high RTF)
 

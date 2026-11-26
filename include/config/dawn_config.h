@@ -248,16 +248,16 @@ typedef struct {
  * ============================================================================= */
 /* Maximum models per provider in the configurable model list. 32 leaves ample
  * room for users curating a large OpenRouter shortlist to test many vendors.
- * Longest slug in use (~29 chars, "google/gemini-3.1-pro-preview") fits well
+ * Longest slug in use (~27 chars, "anthropic/claude-sonnet-5.5") fits well
  * inside NAME_MAX below, so that cap does not need to grow alongside it. */
 #define LLM_CLOUD_MAX_MODELS 32
 #define LLM_CLOUD_MODEL_NAME_MAX 64
 
 /* Default fallback models when no models are configured
- * Updated: 2026-08 - Update these when new model generations are released */
-#define LLM_DEFAULT_OPENAI_MODEL "gpt-5.6-luna"
+ * Updated: 2026-11 - Update these when new model generations are released */
+#define LLM_DEFAULT_OPENAI_MODEL "gpt-6-luna"
 #define LLM_DEFAULT_CLAUDE_MODEL "claude-haiku-5-5"
-#define LLM_DEFAULT_GEMINI_MODEL "gemini-3.7-flash"
+#define LLM_DEFAULT_GEMINI_MODEL "gemini-4-hydrogen"
 #define LLM_DEFAULT_OPENROUTER_MODEL "anthropic/claude-haiku-5.5"
 
 typedef struct {
@@ -365,8 +365,10 @@ typedef struct {
 } llm_silent_observe_config_t;
 
 typedef struct {
-   char type[16];  /* "cloud" or "local" */
-   int max_tokens; /* Max response tokens */
+   char type[16];       /* "cloud" or "local" */
+   int max_tokens;      /* Max response tokens */
+   bool local_fallback; /* An interactive turn whose cloud can't be reached is answered by the
+                         * [llm.local] endpoint (opt-in: only an endpoint the user set up) */
    llm_cloud_config_t cloud;
    llm_local_config_t local;
    llm_tools_config_t tools;                   /* Native tool/function calling settings */
@@ -921,6 +923,10 @@ typedef struct {
  * read.  0 stays legal (means "unset" -> the runtime default in payload_cap()). */
 #define JOBS_EVENT_CHUNK_CAP_MIN 256
 
+/* Default event_chunk_cap, and what an unset (0) cap means at runtime.  The
+ * settings schema (www/js/ui/settings/schema.js) repeats it as its default. */
+#define JOBS_EVENT_CHUNK_CAP_DEFAULT 16384
+
 typedef struct {
    bool enabled;                   /* Master enable/disable for background jobs */
    int max_concurrent_local;       /* Concurrent jobs on a local (GPU) LLM — keep low */
@@ -1048,6 +1054,19 @@ typedef struct {
 /* =============================================================================
  * Secrets Configuration (loaded separately from secrets.toml)
  * ============================================================================= */
+#define MCP_SECRETS_MAX 16     /**< [secrets.mcp] entries (one per MCP server at most) */
+#define MCP_SECRET_NAME_MAX 64 /**< Name length; letters, digits, _ and - only */
+
+/**
+ * @brief An MCP server's bearer token from secrets.toml [secrets.mcp].
+ *
+ * Found by the name a [[mcp.server]] gives in auth_bearer_token_secret.
+ */
+typedef struct {
+   char name[MCP_SECRET_NAME_MAX]; /**< bare TOML key, checked when parsed */
+   char token[CONFIG_API_KEY_MAX]; /**< the bearer token */
+} mcp_secret_t;
+
 typedef struct {
    char openai_api_key[CONFIG_API_KEY_MAX];
    char claude_api_key[CONFIG_API_KEY_MAX];
@@ -1108,6 +1127,10 @@ typedef struct {
     * REST sends.  Required alongside slack_app_token.  Scopes required:
     * chat:write, im:history, im:read, app_mentions:read. */
    char slack_bot_token[CONFIG_API_KEY_MAX];
+
+   /* [secrets.mcp]: name = token */
+   mcp_secret_t mcp[MCP_SECRETS_MAX];
+   int mcp_count;
 } secrets_config_t;
 
 /* =============================================================================
@@ -1125,21 +1148,25 @@ typedef struct {
  * ============================================================================= */
 #define MCP_SERVERS_MAX 16
 #define MCP_SERVER_ALIAS_MAX 64
+#define MCP_SERVER_ROLE_MAX 24
+#define MCP_SERVER_ROLE_AGENT_GATEWAY "agent_gateway" /* a coding-agent gateway */
 
 typedef struct {
    char alias[MCP_SERVER_ALIAS_MAX]; /* server id, used as a tool-name prefix */
-   char url[CONFIG_PATH_MAX];        /* SSE endpoint URL */
-   char transport[16];               /* "http+sse" (Phase 1) */
+   char url[CONFIG_PATH_MAX];        /* SSE endpoint, or the POST endpoint for "http" */
+   char transport[16];               /* "http+sse" | "http" (stateless POST, JSON replies) */
    bool enabled;
    char capabilities[16]; /* "dangerous" (default) | "read_only" */
    int request_timeout_seconds;
    int idle_close_seconds;
    bool tls_verify; /* false requires [mcp] dev_mode = true */
-   /* Bearer token: env-var name is the Phase-1 source (auth_bearer_env). The
-    * secrets.toml key is reserved — resolving it needs a generic by-name secret
-    * lookup that the fixed-field secrets parser does not yet provide. */
+   /* Bearer token: from the env var named by auth_bearer_env if set, else the
+    * [secrets.mcp] entry named by auth_bearer_token_secret. */
    char auth_bearer_env[CONFIG_NAME_MAX];
    char auth_bearer_token_secret[CONFIG_NAME_MAX];
+   /* "" | "agent_gateway": the operator says this server is a coding-agent
+    * gateway, the only kind DAWN sends users' coding tasks to. */
+   char role[MCP_SERVER_ROLE_MAX];
 } mcp_server_config_t;
 
 typedef struct {

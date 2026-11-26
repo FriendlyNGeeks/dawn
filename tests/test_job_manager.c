@@ -93,6 +93,7 @@ void session_release(session_t *s) {
 
 /* Opt-in stale row, so one test can drive the boot interrupted-scan. */
 static bool g_stale_enabled = false;
+static const char *g_stale_kind = ""; /* the stale row's job_kind */
 #define STUB_STALE_ID 999
 
 int conv_db_job_scan_active(job_record_t *out, int max, int *count_out) {
@@ -104,6 +105,7 @@ int conv_db_job_scan_active(job_record_t *out, int max, int *count_out) {
       snprintf(out[0].title, sizeof(out[0].title), "stale");
       snprintf(out[0].on_complete, sizeof(out[0].on_complete), "reinvoke_parent");
       snprintf(out[0].job_status, sizeof(out[0].job_status), "running");
+      snprintf(out[0].job_kind, sizeof(out[0].job_kind), "%s", g_stale_kind);
       out[0].parent_id = 42;
       n = 1;
    }
@@ -246,22 +248,27 @@ int webui_broadcast_job_notification(int user_id, const char *text, int64_t conv
 /* job_update_emit() reads the row back before broadcasting it; these tests
  * exercise pool logic, not the WS frames, so the read reports "not a job" and
  * the emit is a no-op. */
+static job_record_t g_get_row; /* id 0 = no such job */
+
 int conv_db_job_get(int64_t conv_id, int user_id, job_record_t *out) {
-   (void)conv_id;
-   (void)user_id;
-   (void)out;
-   return AUTH_DB_NOT_FOUND;
+   if (g_get_row.id == 0 || conv_id != g_get_row.id) {
+      return AUTH_DB_NOT_FOUND;
+   }
+   if (user_id != g_get_row.user_id) {
+      return AUTH_DB_FORBIDDEN;
+   }
+   *out = g_get_row;
+   return AUTH_DB_SUCCESS;
 }
 
-/* job_manager_cancel_or_retire()'s not-running branch probes the row's status to
- * decide between "retire a queued row" and "already terminal".  These tests only
- * exercise the running-job path (the pool), so report no such job. */
-int conv_db_job_get_status(int64_t conv_id, int user_id, char *status_out, size_t n) {
+int conv_db_job_set_terminal_if_active(int64_t conv_id,
+                                       const char *status,
+                                       const char *error,
+                                       time_t at) {
    (void)conv_id;
-   (void)user_id;
-   if (status_out && n > 0) {
-      status_out[0] = '\0';
-   }
+   (void)status;
+   (void)error;
+   (void)at;
    return AUTH_DB_NOT_FOUND;
 }
 
@@ -363,6 +370,7 @@ void setUp(void) {
    g_missed_inserts = 0;
    g_terminal_n = 0;
    g_stale_enabled = false;
+   g_stale_kind = "";
    atomic_store(&g_emit_alert_calls, 0);
    atomic_store(&g_emit_alert_rc, SUCCESS);
    atomic_store(&g_emit_alert_block, false);
@@ -481,6 +489,70 @@ static void test_for_each_session(void) {
    TEST_ASSERT_EQUAL_INT(0, s_visited);
 }
 
+static int64_t s_hook_conv;
+static int s_hook_user;
+static void coding_cancel(int64_t conv_id, int user_id) {
+   s_hook_conv = conv_id;
+   s_hook_user = user_id;
+}
+
+/* Boot with stale coding row (the stub's one stale row, made a coding job). */
+static int boot_with_stale_coding_row(void) {
+   job_manager_shutdown();
+   g_stale_enabled = true;
+   g_stale_kind = JOB_KIND_CODING;
+   g_terminal_n = 0;
+   TEST_ASSERT_EQUAL_INT(SUCCESS, job_manager_init());
+   return g_terminal_n;
+}
+
+/* Without the coding tool (no hook) nothing would ever end a coding row: a
+ * cancel ends it here, quietly, and a restart interrupts it.  Runs before any
+ * test registers the hook (the table has no unregister). */
+static void test_coding_row_without_its_tool_is_ended_here(void) {
+   memset(&g_get_row, 0, sizeof(g_get_row));
+   g_get_row.id = 78;
+   g_get_row.user_id = 5;
+   snprintf(g_get_row.job_kind, sizeof(g_get_row.job_kind), "%s", JOB_KIND_CODING);
+   snprintf(g_get_row.job_status, sizeof(g_get_row.job_status), "running");
+   TEST_ASSERT_EQUAL_INT(JOB_CANCEL_RETIRED, job_manager_cancel_or_retire(78, 5, NULL, 0));
+   TEST_ASSERT_TRUE(stub_was_fired(78));
+   memset(&g_get_row, 0, sizeof(g_get_row));
+
+   TEST_ASSERT_EQUAL_INT(1, boot_with_stale_coding_row());
+   TEST_ASSERT_EQUAL_STRING("interrupted", g_terminal[0].status);
+}
+
+/* With its tool, a restart leaves a coding row to the tool (its gateway still
+ * runs it).  Runs after the hook is registered. */
+static void test_boot_leaves_coding_rows_to_their_tool(void) {
+   TEST_ASSERT_EQUAL_INT(0, boot_with_stale_coding_row());
+}
+
+/* A kind with a cancel hook has no worker here: an active row goes to the
+ * hook; an ended one, or another user's, doesn't. */
+static void test_cancel_routes_a_kind_to_its_hook(void) {
+   TEST_ASSERT_EQUAL_INT(SUCCESS, job_manager_register_kind_cancel(JOB_KIND_CODING, coding_cancel));
+   memset(&g_get_row, 0, sizeof(g_get_row));
+   g_get_row.id = 77;
+   g_get_row.user_id = 5;
+   snprintf(g_get_row.job_kind, sizeof(g_get_row.job_kind), "%s", JOB_KIND_CODING);
+   const char *active[] = { "running", "queued" };
+   for (int i = 0; i < 2; i++) {
+      snprintf(g_get_row.job_status, sizeof(g_get_row.job_status), "%s", active[i]);
+      s_hook_conv = 0;
+      TEST_ASSERT_EQUAL_INT(JOB_CANCEL_SIGNALLED, job_manager_cancel_or_retire(77, 5, NULL, 0));
+      TEST_ASSERT_EQUAL_INT64(77, s_hook_conv);
+      TEST_ASSERT_EQUAL_INT(5, s_hook_user);
+   }
+   s_hook_conv = 0;
+   TEST_ASSERT_EQUAL_INT(JOB_CANCEL_FORBIDDEN, job_manager_cancel_or_retire(77, 6, NULL, 0));
+   snprintf(g_get_row.job_status, sizeof(g_get_row.job_status), "done");
+   TEST_ASSERT_EQUAL_INT(JOB_CANCEL_ALREADY_TERMINAL, job_manager_cancel_or_retire(77, 5, NULL, 0));
+   TEST_ASSERT_EQUAL_INT64(0, s_hook_conv);
+   memset(&g_get_row, 0, sizeof(g_get_row));
+}
+
 static void test_cancel_ownership(void) {
    session_t *a = NULL;
    TEST_ASSERT_EQUAL_INT(JOB_MGR_OK, job_manager_begin(5, 42, JOB_PROVIDER_CLOUD, &a));
@@ -515,7 +587,7 @@ static void test_reap_overdue(void) {
 
    /* The worker claims the verdict — true, so it records `failed`/timed-out
     * rather than `cancelled` (which would suppress the completion follow-up). */
-   TEST_ASSERT_TRUE(job_manager_claim_reaped(a, NULL));
+   TEST_ASSERT_TRUE(job_manager_claim_reaped(a->session_id, NULL));
 
    /* The slot is only released by the worker's job_manager_end(). */
    TEST_ASSERT_EQUAL_INT(1, job_manager_running_count());
@@ -531,7 +603,7 @@ static void test_claim_stops_the_reap_clock(void) {
    TEST_ASSERT_EQUAL_INT(JOB_MGR_OK, job_manager_begin(1, 708, JOB_PROVIDER_CLOUD, &a));
 
    /* Worker finishes just under the wire and claims: not reaped. */
-   TEST_ASSERT_FALSE(job_manager_claim_reaped(a, NULL));
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(a->session_id, NULL));
 
    /* A tick well past the deadline must now find nothing to reap. */
    TEST_ASSERT_EQUAL_INT(0, job_manager_reap_overdue(time(NULL) + 999999));
@@ -561,7 +633,7 @@ static void test_reap_force_releases_provider_counter(void) {
    TEST_ASSERT_EQUAL_INT(JOB_MGR_OK, job_manager_begin(1, 711, JOB_PROVIDER_LOCAL, &next));
 
    /* The zombie's slot is still occupied, so its session is still resolvable. */
-   TEST_ASSERT_TRUE(job_manager_claim_reaped(stuck, NULL));
+   TEST_ASSERT_TRUE(job_manager_claim_reaped(stuck->session_id, NULL));
 
    /* If the zombie ever returns, job_manager_end must NOT double-decrement. */
    job_manager_end(stuck);
@@ -576,7 +648,7 @@ static void test_reap_not_yet_overdue(void) {
 
    /* Exactly at the limit is NOT overdue (strictly-greater comparison). */
    TEST_ASSERT_EQUAL_INT(0, job_manager_reap_overdue(time(NULL) + g_config.jobs.max_runtime_sec));
-   TEST_ASSERT_FALSE(job_manager_claim_reaped(a, NULL));
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(a->session_id, NULL));
    TEST_ASSERT_FALSE(atomic_load(&a->cancel_requested));
 
    job_manager_end(a);
@@ -588,7 +660,7 @@ static void test_reap_disabled_when_zero(void) {
    TEST_ASSERT_EQUAL_INT(JOB_MGR_OK, job_manager_begin(1, 702, JOB_PROVIDER_CLOUD, &a));
 
    TEST_ASSERT_EQUAL_INT(0, job_manager_reap_overdue(time(NULL) + 999999));
-   TEST_ASSERT_FALSE(job_manager_claim_reaped(a, NULL));
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(a->session_id, NULL));
    TEST_ASSERT_FALSE(atomic_load(&a->cancel_requested));
 
    job_manager_end(a);
@@ -600,7 +672,7 @@ static void test_reap_ignores_backwards_clock(void) {
 
    /* An NTP step backwards must not mass-reap the pool (negative elapsed). */
    TEST_ASSERT_EQUAL_INT(0, job_manager_reap_overdue(time(NULL) - 999999));
-   TEST_ASSERT_FALSE(job_manager_claim_reaped(a, NULL));
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(a->session_id, NULL));
 
    job_manager_end(a);
 }
@@ -613,7 +685,7 @@ static void test_reap_distinct_from_user_cancel(void) {
     * a reap — otherwise the worker would fire a follow-up for a cancelled job. */
    TEST_ASSERT_EQUAL_INT(JOB_MGR_OK, job_manager_cancel(704, 5));
    TEST_ASSERT_TRUE(atomic_load(&a->cancel_requested));
-   TEST_ASSERT_FALSE(job_manager_claim_reaped(a, NULL));
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(a->session_id, NULL));
 
    job_manager_end(a);
 }
@@ -639,11 +711,28 @@ static void test_reap_all_overdue_slots(void) {
    job_manager_end(c);
 }
 
-static void test_claim_reaped_null_and_unknown(void) {
-   TEST_ASSERT_FALSE(job_manager_claim_reaped(NULL, NULL));
-   session_t orphan;
-   memset(&orphan, 0, sizeof(orphan)); /* never in the pool */
-   TEST_ASSERT_FALSE(job_manager_claim_reaped(&orphan, NULL));
+static void test_claim_reaped_unknown_id(void) {
+   bool user_cancelled = true;
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(0, &user_cancelled)); /* the local session's id */
+   TEST_ASSERT_FALSE(user_cancelled);
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(UINT32_MAX, NULL)); /* never issued */
+}
+
+/* A finished job's id names nothing once its slot is reused: claiming with it
+ * must neither take the next job's verdict nor stop that job's reap clock. */
+static void test_claim_reaped_by_a_finished_id_misses_the_slots_next_job(void) {
+   g_config.jobs.max_runtime_sec = 10;
+   session_t *a = NULL, *b = NULL;
+   TEST_ASSERT_EQUAL_INT(JOB_MGR_OK, job_manager_begin(1, 720, JOB_PROVIDER_CLOUD, &a));
+   const uint32_t old_id = a->session_id;
+   job_manager_end(a);
+   TEST_ASSERT_EQUAL_INT(JOB_MGR_OK, job_manager_begin(1, 721, JOB_PROVIDER_CLOUD, &b));
+   TEST_ASSERT_NOT_EQUAL(old_id, b->session_id);
+
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(old_id, NULL));
+   TEST_ASSERT_EQUAL_INT(1, job_manager_reap_overdue(time(NULL) + 11)); /* b's clock still ran */
+   TEST_ASSERT_TRUE(job_manager_claim_reaped(b->session_id, NULL));
+   job_manager_end(b);
 }
 
 /* A human's Cancel and the shutdown sweep raise the SAME cancel_requested flag,
@@ -657,7 +746,7 @@ static void test_user_cancel_verdict_is_per_job(void) {
    TEST_ASSERT_EQUAL_INT(JOB_MGR_OK, job_manager_cancel(1400, 1));
 
    bool user_cancelled = false;
-   TEST_ASSERT_FALSE(job_manager_claim_reaped(a, &user_cancelled));
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(a->session_id, &user_cancelled));
    TEST_ASSERT_TRUE(user_cancelled);
    job_manager_end(a);
 
@@ -665,7 +754,7 @@ static void test_user_cancel_verdict_is_per_job(void) {
    session_t *b = NULL;
    TEST_ASSERT_EQUAL_INT(JOB_MGR_OK, job_manager_begin(1, 1401, JOB_PROVIDER_CLOUD, &b));
    user_cancelled = true; /* poison the out-param so a no-op write would show */
-   TEST_ASSERT_FALSE(job_manager_claim_reaped(b, &user_cancelled));
+   TEST_ASSERT_FALSE(job_manager_claim_reaped(b->session_id, &user_cancelled));
    TEST_ASSERT_FALSE(user_cancelled);
    job_manager_end(b);
 }
@@ -948,6 +1037,9 @@ int main(void) {
    RUN_TEST(test_resolver);
    RUN_TEST(test_for_each_session);
    RUN_TEST(test_cancel_ownership);
+   RUN_TEST(test_coding_row_without_its_tool_is_ended_here);
+   RUN_TEST(test_cancel_routes_a_kind_to_its_hook);
+   RUN_TEST(test_boot_leaves_coding_rows_to_their_tool);
    RUN_TEST(test_reap_overdue);
    RUN_TEST(test_reap_not_yet_overdue);
    RUN_TEST(test_reap_disabled_when_zero);
@@ -956,7 +1048,8 @@ int main(void) {
    RUN_TEST(test_reap_all_overdue_slots);
    RUN_TEST(test_claim_stops_the_reap_clock);
    RUN_TEST(test_reap_force_releases_provider_counter);
-   RUN_TEST(test_claim_reaped_null_and_unknown);
+   RUN_TEST(test_claim_reaped_unknown_id);
+   RUN_TEST(test_claim_reaped_by_a_finished_id_misses_the_slots_next_job);
    RUN_TEST(test_user_cancel_verdict_is_per_job);
    RUN_TEST(test_shutdown_can_be_noted_before_teardown);
    RUN_TEST(test_undeliverable_notice_is_queued_not_dropped);

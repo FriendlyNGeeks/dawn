@@ -560,10 +560,11 @@ int auth_db_delete_session(const char *token);
  * @brief Delete a session by token prefix
  *
  * Finds and deletes the session matching the 16-character token prefix.
- * Returns AUTH_DB_NOT_FOUND if no matching session exists.
+ * Returns AUTH_DB_NOT_FOUND if no matching session exists, and
+ * AUTH_DB_DUPLICATE (deleting nothing) if more than one session shares it.
  *
  * @param prefix 16-character token prefix
- * @return AUTH_DB_SUCCESS, AUTH_DB_NOT_FOUND, or AUTH_DB_FAILURE
+ * @return AUTH_DB_SUCCESS, AUTH_DB_NOT_FOUND, AUTH_DB_DUPLICATE, or AUTH_DB_FAILURE
  */
 int auth_db_delete_session_by_prefix(const char *prefix);
 
@@ -1148,6 +1149,7 @@ typedef struct {
    int is_error; /**< role='tool' rows: 1 = confirmed failure (reds the pill on reload); else 0 */
    char *email_ref; /**< user rows: the email the question was asked about (a JSON object), else
                          NULL (borrowed) */
+   bool stopped;    /**< assistant rows: a reply the user stopped before it finished */
 } conversation_message_t;
 
 /**
@@ -1258,6 +1260,30 @@ int conv_db_create_ex(int user_id,
                       bool is_private,
                       int64_t *conv_id_out);
 
+/** A lease to take on a conversation as it is created (conv_db_create_claimed). */
+typedef struct {
+   uint32_t session; /* the holder's session id, for diagnostics */
+   uint64_t token;   /* from conv_turn_lease_new_token() */
+   bool claimed;     /* out: taken; release it with @c token once its rows are written */
+} conv_create_claim_t;
+
+/**
+ * @brief conv_db_create_ex(), taking the new conversation's turn lease
+ *        (conv_turn_lease.h) before anyone is told it exists
+ *
+ * For a creator that writes the new conversation's first rows itself (or a
+ * turn that will): no turn begun from the conversation list can come in
+ * between.  The claim never waits (nothing else knows the id).
+ *
+ * @param claim In: who claims; out: claimed (may be NULL: no claim)
+ */
+int conv_db_create_claimed(int user_id,
+                           const char *title,
+                           const char *origin,
+                           bool is_private,
+                           conv_create_claim_t *claim,
+                           int64_t *conv_id_out);
+
 /**
  * @brief Reassign a conversation to a different user (admin only)
  *
@@ -1323,8 +1349,11 @@ int conv_db_create_continuation(int user_id,
 #define JOB_SPAWN_MODE_MAX 16  /**< "detached" (v1) */
 #define JOB_ON_COMPLETE_MAX 24 /**< "reinvoke_parent" (Phase 3) */
 #define JOB_KIND_MAX 16        /**< "research" discriminator; "" = ordinary job */
-#define JOB_DELIVER_TO_MAX 64  /**< messaging channel display_name */
-#define JOB_ERROR_MAX 256      /**< truncated failure reason */
+/* Stored job_kind values (append only). */
+#define JOB_KIND_RESEARCH "research" /**< a deep-research run (research_worker) */
+#define JOB_KIND_CODING "coding"     /**< a task an agent gateway runs; no DAWN worker */
+#define JOB_DELIVER_TO_MAX 64        /**< messaging channel display_name */
+#define JOB_ERROR_MAX 256            /**< truncated failure reason */
 
 /**
  * @brief A background job's lifecycle row (subset of `conversations` columns).
@@ -1380,13 +1409,24 @@ int conv_db_create_job(int user_id,
                        const char *goal,
                        int64_t *conv_id_out);
 
+/** A conversation's LLM columns, as written to its row (NULL or "": none). */
+typedef struct {
+   const char *llm_type;
+   const char *cloud_provider;
+   const char *model;
+   const char *thinking_mode;
+   const char *reasoning_effort;
+} conv_llm_columns_t;
+
 /**
  * @brief As conv_db_create_job(), but records the spawn surface in
- *        conversations.origin.
+ *        conversations.origin and the LLM the job runs on.
  *
  * @param origin Spawn surface ("voice"/"webui"/"messaging"/"satellite"); gates
  *        voice completion delivery. NULL/"" → "job". Job identity is
  *        job_status, not this field. The plain conv_db_create_job() passes "job".
+ * @param llm    The LLM the job runs on, written with the row; NULL: none (the
+ *        job follows the default).
  */
 int conv_db_create_job_ex(int user_id,
                           const char *title,
@@ -1397,6 +1437,7 @@ int conv_db_create_job_ex(int user_id,
                           int spawn_depth,
                           const char *goal,
                           const char *origin,
+                          const conv_llm_columns_t *llm,
                           int64_t *conv_id_out);
 
 /**
@@ -1428,6 +1469,21 @@ int conv_db_job_set_terminal(int64_t conv_id,
                              const char *status,
                              const char *error_or_null,
                              time_t finished_at);
+
+/**
+ * @brief System-caller: conv_db_job_set_terminal() only while the job is
+ *        still queued or running.
+ *
+ * For a job whose end can be reported more than once (a coding task's
+ * events replayed after a restart): the first report wins, later ones change
+ * nothing.
+ * @return AUTH_DB_SUCCESS (now terminal), AUTH_DB_NOT_FOUND (already terminal,
+ *         or no such job), AUTH_DB_INVALID or AUTH_DB_FAILURE.
+ */
+int conv_db_job_set_terminal_if_active(int64_t conv_id,
+                                       const char *status,
+                                       const char *error_or_null,
+                                       time_t finished_at);
 
 /**
  * @brief System-caller: set on_complete_fired=1 (idempotency / follow-up guard).
@@ -1462,6 +1518,22 @@ int conv_db_job_get(int64_t conv_id, int user_id, job_record_t *out);
  * @return AUTH_DB_SUCCESS, AUTH_DB_NOT_FOUND, AUTH_DB_FORBIDDEN, AUTH_DB_FAILURE.
  */
 int conv_db_job_get_status(int64_t conv_id, int user_id, char *status_out, size_t n);
+
+/**
+ * @brief Whether deleting @p conv_id would drop a coding job whose work may
+ *        still be at the agent gateway: it, or one of its child jobs, is a
+ *        coding job that ran there (started, or its trail has a gateway event)
+ *        with no event saying its task was closed.  None for a coding job that
+ *        never reached the gateway, and for any other conversation.
+ *
+ * @param conv_id The conversation to be deleted (a job or a chat).
+ * @param user_id Its owner.
+ * @param holder  Receives the id of a coding job that holds work (@p conv_id
+ *                itself or a child of it), 0 when none; 0 unless SUCCESS.
+ * @return AUTH_DB_SUCCESS, AUTH_DB_INVALID, AUTH_DB_NOT_FOUND, AUTH_DB_FORBIDDEN,
+ *         AUTH_DB_FAILURE.
+ */
+int conv_db_job_holds_agent_work(int64_t conv_id, int user_id, int64_t *holder);
 
 /**
  * @brief Ownership-scoped: list a user's jobs (newest first), up to @p max.
@@ -1502,6 +1574,13 @@ int conv_db_job_pending_reinvoke_for_parent(int64_t parent_id,
  * @return AUTH_DB_SUCCESS or AUTH_DB_FAILURE.
  */
 int conv_db_job_scan_active(job_record_t *out, int max, int *count_out);
+
+/**
+ * @brief System-caller: the jobs of one kind still running/queued, oldest
+ *        first.
+ * @return AUTH_DB_SUCCESS, AUTH_DB_INVALID or AUTH_DB_FAILURE.
+ */
+int conv_db_job_scan_active_kind(const char *kind, job_record_t *out, int max, int *count_out);
 
 /**
  * @brief System-caller: mark several jobs' on_complete_fired=1 in one transaction.
@@ -1546,6 +1625,29 @@ int conv_db_job_bump_reinvoke(int64_t conv_id, int *new_count_out);
  *         or AUTH_DB_FAILURE.
  */
 int conv_db_job_reset_for_resume(int64_t conv_id, int user_id, bool allow_cancelled);
+
+/**
+ * @brief Reopen a finished coding job for more work (its agent's session resumes).
+ *
+ * A claim, like conv_db_job_reset_for_resume: one UPDATE takes a coding job of
+ * @p user_id from 'done' or 'failed' to 'queued' (never a cancelled one), clears
+ * job_error, finished_at and on_complete_fired (so its next end is reported),
+ * and sets job_goal to @p goal (what the next end is judged against).
+ * @return AUTH_DB_SUCCESS (claimed), AUTH_DB_NOT_FOUND (absent, not the user's,
+ *         not a coding job, or not done/failed), AUTH_DB_INVALID or AUTH_DB_FAILURE.
+ */
+int conv_db_job_reopen_coding(int64_t conv_id, int user_id, const char *goal);
+
+/**
+ * @brief Move job @p job_id of @p user_id under conversation @p parent_id (its
+ *        report then goes there).
+ *
+ * Only a job row (job_status set) owned by @p user_id, and only under a
+ * conversation the same user owns.
+ * @return AUTH_DB_SUCCESS, AUTH_DB_NOT_FOUND (no such job of the user's, or the
+ *         parent isn't the user's), AUTH_DB_INVALID or AUTH_DB_FAILURE.
+ */
+int conv_db_job_set_parent(int64_t job_id, int user_id, int64_t parent_id);
 
 /**
  * @brief Ownership-scoped: a user's ACTIVE (queued/running) jobs, oldest first.
@@ -1979,6 +2081,16 @@ int conv_db_list_all(bool include_archived,
  */
 int conv_db_rename(int64_t conv_id, int user_id, const char *new_title);
 
+/** Memory consolidation batches a privacy change or a delete removed, or whose
+ *  rows it removed: the newest this many, each once. */
+#define CONV_DB_BATCHES_MAX 256
+
+typedef struct {
+   int user_id; /**< their owner */
+   int64_t ids[CONV_DB_BATCHES_MAX];
+   int n;
+} conv_db_batches_t;
+
 /**
  * @brief Set private mode for a conversation
  *
@@ -1988,12 +2100,20 @@ int conv_db_rename(int64_t conv_id, int user_id, const char *new_title);
  * a public continuation would leak the parent's content into memory.  Making one
  * public changes only that conversation.
  *
+ * Going private also removes what memory recorded of them (their consolidation
+ * batches, and other batches' rows quoting them); those batches come back in
+ * @p batches_out, for memory_consolidation_batch_notify once the call returns.
+ *
  * @param conv_id Conversation ID
  * @param user_id User ID (for authorization check)
  * @param is_private True to enable private mode, false to disable
+ * @param batches_out The batches removed or changed (n = 0 on failure; may be NULL)
  * @return AUTH_DB_SUCCESS, AUTH_DB_NOT_FOUND, AUTH_DB_FORBIDDEN, or AUTH_DB_FAILURE
  */
-int conv_db_set_private(int64_t conv_id, int user_id, bool is_private);
+int conv_db_set_private(int64_t conv_id,
+                        int user_id,
+                        bool is_private,
+                        conv_db_batches_t *batches_out);
 
 /** Upper bound on conv_db_continuation_chain() results. */
 #define CONV_CHAIN_MAX 256
@@ -2113,8 +2233,10 @@ int conv_db_messages_unprompted(int user_id,
  *
  * By CONV_ROW_OUTSIDE_KIND_SQL: DAWN's posts, a turn context's outside items,
  * a job's result, an attached document, a device's data, request-context
- * rows included (the history loaders leave those out).  Tool results aren't
- * judged here (the live scan judges them).
+ * rows included (the history loaders leave those out); and by
+ * CONV_TOOL_FRAME_KIND_SQL a tool result DAWN framed as someone else's text.
+ * An unframed tool result isn't judged here (the live scan judges it by its
+ * call).
  *
  * @param conv_id  Conversation (owned by @p user_id)
  * @param user_id  Owner
@@ -2128,6 +2250,38 @@ int conv_db_rows_outside(int64_t conv_id,
                          int64_t after_id,
                          int64_t upto_id,
                          int *kind_out);
+
+/**
+ * @brief The exchange rows of a conversation that a history lacks
+ *
+ * The rows in (@p after_id, @p upto_id] whose ids aren't in @p ids_json, of
+ * these only: ordinary user and assistant rows, typed, spoken or sent over a
+ * messaging channel alike, with no kind (no request context), no tool calls
+ * (an empty list counts as none), and not one of DAWN's unprompted posts.
+ * Such a row is missing when another session wrote it into the conversation,
+ * or a compaction took it out of a live history (extraction-time only).
+ *
+ * Tool-call and tool-result rows are left out: a live history's copies of
+ * them carry no id, so counting them would report every tool turn missing.
+ * The narration on a tool-call row is therefore not guarded.  A null in
+ * @p ids_json is ignored, so it can only make a row count as missing.
+ *
+ * @param conv_id     Conversation (owned by @p user_id)
+ * @param user_id     Owner
+ * @param after_id    Rows with a larger id are read
+ * @param upto_id     ... up to and including this id
+ * @param ids_json    JSON array of the ids the history holds
+ * @param missing_out Receives how many are missing
+ * @param first_out   Receives the lowest missing id (0 when none)
+ * @return AUTH_DB_SUCCESS or AUTH_DB_FAILURE
+ */
+int conv_db_exchange_rows_missing(int64_t conv_id,
+                                  int user_id,
+                                  int64_t after_id,
+                                  int64_t upto_id,
+                                  const char *ids_json,
+                                  int *missing_out,
+                                  int64_t *first_out);
 
 /**
  * Sentinel value for "no anchor recorded" on conversations.anchor_date.
@@ -2291,6 +2445,30 @@ int conv_db_update_llm_settings(int64_t conv_id,
                                 const char *tools_mode,
                                 const char *thinking_mode,
                                 const char *reasoning_effort);
+
+/** system_metadata key marking conv_db_unpin_default_llm() done. */
+#define CONV_DB_UNPIN_MARKER "llm_rows_follow_default"
+
+/**
+ * @brief Once per database: conversations stored with the default selection
+ *        follow the default from now on
+ *
+ * Until this version, every WebUI conversation stored the LLM it was created on,
+ * so each looked like a choice the user made.  Clears llm_type, cloud_provider
+ * and model (reasoning kept) on cloud rows equal to a cloud default; rows that
+ * differ, local rows and messaging rows keep their selection.  Runs once (a
+ * system_metadata marker, set whatever the default); later calls do nothing.
+ *
+ * @param llm_type       "local" or "cloud"
+ * @param cloud_provider The default's provider name ("none" for local)
+ * @param model          The default's model ("" for a local server's own)
+ * @param[out] changed_out Rows cleared (0 when already done); may be NULL
+ * @return AUTH_DB_SUCCESS or AUTH_DB_FAILURE
+ */
+int conv_db_unpin_default_llm(const char *llm_type,
+                              const char *cloud_provider,
+                              const char *model,
+                              int *changed_out);
 
 /**
  * @brief Fill only the LLM-settings columns that are currently NULL/empty.
@@ -2550,6 +2728,14 @@ int conv_db_briefing_mark_extracted(int64_t conv_id,
                                     int user_id,
                                     int64_t *end_id_out,
                                     bool *replied_out);
+
+/**
+ * @brief conv_db_briefing_mark_extracted() without moving the cursor: where
+ *        the briefing ends and whether the user replied, for a read that must
+ *        change nothing (a range extraction, its dry run)
+ * @return AUTH_DB_SUCCESS, AUTH_DB_FORBIDDEN, or AUTH_DB_FAILURE
+ */
+int conv_db_briefing_end(int64_t conv_id, int user_id, int64_t *end_id_out, bool *replied_out);
 
 /* =============================================================================
  * Summary Nodes (LCM Phase 4 — hierarchical summaries)

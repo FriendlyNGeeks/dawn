@@ -40,7 +40,6 @@
 #include "logging.h"
 #include "memory/memory_history_loader.h"
 #include "memory/memory_note_guard.h"
-#include "memory/memory_types.h"
 #include "prompts.h"
 #include "tools/tool_registry.h"
 #include "utils/string_utils.h"
@@ -205,17 +204,35 @@ static bool result_is_own(struct json_object *history, size_t at, const char *id
    return own;
 }
 
-/* Whether @p content (a string or text parts) holds @p needle. */
-static bool content_has(struct json_object *content, const char *needle) {
+/* Whether @p text holds a source excerpt of a conversation that read outside
+ * text: a line "[source: conv=... msgs=...] (outside)" (memory_callback.c),
+ * under which the stored messages are quoted verbatim. */
+static bool text_has_outside_excerpt(const char *text) {
+   static const size_t head = sizeof(OUTSIDE_MARKER_SOURCE_HEAD) - 1;
+   static const size_t mark = sizeof(OUTSIDE_MARKER_MEMORY_MARK) - 1;
+   for (const char *line = text; line && *line;) {
+      const char *end = strchr(line, '\n');
+      const size_t n = end ? (size_t)(end - line) : strlen(line);
+      if (n >= head + mark && strncmp(line, OUTSIDE_MARKER_SOURCE_HEAD, head) == 0 &&
+          memcmp(line + n - mark, OUTSIDE_MARKER_MEMORY_MARK, mark) == 0) {
+         return true;
+      }
+      line = end ? end + 1 : NULL;
+   }
+   return false;
+}
+
+/* Whether a tool result's content (a string, or text parts) holds one. */
+static bool content_has_outside_excerpt(struct json_object *content) {
    if (json_object_is_type(content, json_type_string)) {
-      return strstr(json_object_get_string(content), needle) != NULL;
+      return text_has_outside_excerpt(json_object_get_string(content));
    }
    for (size_t i = 0;
         json_object_is_type(content, json_type_array) && i < json_object_array_length(content);
         i++) {
       struct json_object *text = NULL;
       if (json_object_object_get_ex(json_object_array_get_idx(content, i), "text", &text) &&
-          strstr(json_object_get_string(text), needle)) {
+          text_has_outside_excerpt(json_object_get_string(text))) {
          return true;
       }
    }
@@ -223,9 +240,10 @@ static bool content_has(struct json_object *content, const char *needle) {
 }
 
 /* A tool result's outside kind: its frame's, when DAWN framed it; none for one
- * of DAWN's own tools, unless it is the memory store returning rows learned
- * from outside text (each listed with its kind word); any other tool's (or
- * one whose call isn't found) counts as outside text. */
+ * of DAWN's own tools (the memory store's rows learned from outside text
+ * included: they say so, but are its own rendering of what it stored), unless
+ * it quotes a tainted conversation's messages (a source excerpt); any other
+ * tool's (or one whose call isn't found) counts as outside text. */
 static int result_outside(struct json_object *history,
                           size_t at,
                           const char *call_id,
@@ -234,9 +252,7 @@ static int result_outside(struct json_object *history,
    if (frame) {
       return llm_third_party_outside_kind(frame);
    }
-   if (!result_is_own(history, at, call_id) ||
-       content_has(content, OUTSIDE_MARKER_KIND_SUFFIX ")") ||
-       content_has(content, MEMORY_OUTSIDE_MARK)) {
+   if (!result_is_own(history, at, call_id) || content_has_outside_excerpt(content)) {
       return OUTSIDE_OTHER;
    }
    return OUTSIDE_NONE;
@@ -244,10 +260,13 @@ static int result_outside(struct json_object *history,
 
 /* The outside kind of the turn's items DAWN put in a turn context
  * (focus_incremental.c renders "[M3 source kind date] text", or without the
- * handle when an item has none): an item from an outside source, or a memory
- * learned from outside text, carries "outside" in its kind word.  A document's
- * chunk is a document; anything else OTHER. */
+ * handle when an item has none): an item from an outside source carries
+ * "outside" in its kind word; any document's chunk makes it a document, else
+ * any calendar event a calendar event, else OTHER.  A recalled memory's
+ * "outside" (where it was learned) doesn't count; CONV_ROW_OUTSIDE_KIND_SQL
+ * reads stored rows the same way. */
 static int focus_items_outside(const char *text) {
+   int kind = OUTSIDE_NONE;
    for (const char *line = text; line && *line;) {
       const char *end = strchr(line, '\n');
       const char *close = memchr(line, ']', end ? (size_t)(end - line) : strlen(line));
@@ -258,14 +277,19 @@ static int focus_items_outside(const char *text) {
          char head[160];
          const size_t len = n - 1 < sizeof(head) - 2 ? n - 1 : sizeof(head) - 2;
          snprintf(head, sizeof(head), " %.*s", (int)len, line + 1);
-         if (strstr(head, " " OUTSIDE_MARKER_ITEM_KIND)) {
-            return strstr(head, " " OUTSIDE_MARKER_DOC_SOURCE " ") ? OUTSIDE_DOCUMENT
-                                                                   : OUTSIDE_OTHER;
+         if (strstr(head, " " OUTSIDE_MARKER_ITEM_KIND) &&
+             !strstr(head, " " OUTSIDE_MARKER_MEMORY_SOURCE)) {
+            if (strstr(head, " " OUTSIDE_MARKER_DOC_SOURCE " ")) {
+               return OUTSIDE_DOCUMENT;
+            }
+            kind = strstr(head, " " OUTSIDE_MARKER_CAL_SOURCE " ") ? OUTSIDE_CALENDAR
+                   : kind == OUTSIDE_NONE                          ? OUTSIDE_OTHER
+                                                                   : kind;
          }
       }
       line = end ? end + 1 : NULL;
    }
-   return OUTSIDE_NONE;
+   return kind;
 }
 
 static bool text_has_document(struct json_object *text) {
@@ -597,6 +621,56 @@ int64_t memory_extraction_history_first_id(struct json_object *history) {
    return first;
 }
 
+struct json_object *memory_extraction_history_whole(int user_id,
+                                                    int64_t conversation_id,
+                                                    struct json_object *history,
+                                                    int64_t last_msg_id) {
+   if (!history) {
+      return NULL;
+   }
+   const int64_t upto = memory_extraction_history_max_id(history);
+   if (conversation_id <= 0 || upto <= last_msg_id) {
+      return json_object_get(history);
+   }
+   /* Every id the history holds, whatever its row: only rows the database
+    * has and the history lacks matter.  An id dropped here would hide its row,
+    * so a failed allocation refuses the batch. */
+   struct json_object *ids = json_object_new_array();
+   bool built = ids != NULL;
+   for (size_t i = 0; built && i < json_object_array_length(history); i++) {
+      struct json_object *id = NULL;
+      if (json_object_object_get_ex(json_object_array_get_idx(history, i), "id", &id) &&
+          json_object_get_int64(id) > last_msg_id) {
+         struct json_object *v = json_object_new_int64(json_object_get_int64(id));
+         if (!v || json_object_array_add(ids, v) != 0) {
+            json_object_put(v);
+            built = false;
+         }
+      }
+   }
+   const char *ids_json = built ? json_object_to_json_string_ext(ids, JSON_C_TO_STRING_PLAIN)
+                                : NULL;
+   int missing = 0;
+   int64_t first = 0;
+   const int rc = ids_json ? conv_db_exchange_rows_missing(conversation_id, user_id, last_msg_id,
+                                                           upto, ids_json, &missing, &first)
+                           : AUTH_DB_FAILURE;
+   json_object_put(ids);
+   if (rc != AUTH_DB_SUCCESS) {
+      OLOG_WARNING("memory_extraction: refusing conv %lld for user %d: history check failed",
+                   (long long)conversation_id, user_id);
+      return NULL;
+   }
+   if (missing == 0) {
+      return json_object_get(history);
+   }
+   OLOG_WARNING("memory_extraction: conv %lld: history lacks %d row(s) in (%lld, %lld], first "
+                "%lld; extracting the stored conversation",
+                (long long)conversation_id, missing, (long long)last_msg_id, (long long)upto,
+                (long long)first);
+   return memory_history_load_from_db(conversation_id, user_id, NULL);
+}
+
 bool memory_extraction_input_has_question(struct json_object *input) {
    for (size_t i = 0; input && i < json_object_array_length(input); i++) {
       if (llm_history_is_question(json_object_array_get_idx(input, i))) {
@@ -651,6 +725,28 @@ static struct json_object *drop_unprompted(int user_id,
    return kept;
 }
 
+/* @p history without the replies the user stopped: cut off, often because
+ * they were going wrong, so nothing to learn from.  Shared when it has none;
+ * NULL on allocation failure. */
+static struct json_object *without_stopped(struct json_object *history) {
+   const size_t n = json_object_array_length(history);
+   size_t stopped = 0;
+   for (size_t i = 0; i < n; i++) {
+      stopped += llm_history_is_stopped(json_object_array_get_idx(history, i));
+   }
+   if (stopped == 0) {
+      return json_object_get(history);
+   }
+   struct json_object *kept = json_object_new_array_ext((int)(n - stopped));
+   for (size_t i = 0; kept && i < n; i++) {
+      struct json_object *msg = json_object_array_get_idx(history, i);
+      if (!llm_history_is_stopped(msg)) {
+         json_object_array_add(kept, json_object_get(msg));
+      }
+   }
+   return kept;
+}
+
 int memory_extraction_history_outside(int user_id,
                                       int64_t conversation_id,
                                       struct json_object *history,
@@ -678,7 +774,9 @@ struct json_object *memory_extraction_build_input(int user_id,
     * then extracted without it. */
    *outside_out = memory_extraction_history_outside(user_id, conversation_id, conversation_history,
                                                     last_msg_id);
-   struct json_object *history = llm_history_strip_internal(conversation_history);
+   struct json_object *spoken = without_stopped(conversation_history);
+   struct json_object *history = spoken ? llm_history_strip_internal(spoken) : NULL;
+   json_object_put(spoken);
    if (!history) {
       return NULL;
    }

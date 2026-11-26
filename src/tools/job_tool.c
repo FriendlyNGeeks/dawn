@@ -44,6 +44,7 @@
 #include "core/session_manager.h"
 #include "dawn_error.h"
 #include "llm/llm_interface.h"
+#include "llm/llm_selection.h"
 #include "logging.h"
 #include "tools/tool_registry.h"
 
@@ -81,9 +82,17 @@ static char *handle_spawn(struct json_object *details,
    if (goal == NULL || goal[0] == '\0') {
       return strdup(TOOL_RESULT_ERROR_MARK "Error: 'goal' is required to start a background job.");
    }
-   if (memory_filter_check(goal)) {
-      return strdup(TOOL_RESULT_ERROR_MARK
-                    "Error: that job goal was rejected by the safety filter.");
+   /* The goal is the user's request in the model's words, so only phrases that
+    * read as a command to the model are refused; the refusal names the phrase. */
+   const char *blocked = memory_filter_injection_command_match(goal);
+   if (blocked != NULL) {
+      char refusal[256];
+      snprintf(refusal, sizeof(refusal),
+               TOOL_RESULT_ERROR_MARK "Error: that job goal contains \"%s\", which reads as an "
+                                      "instruction to the model, so it was refused. Reword that "
+                                      "phrase and try again.",
+               blocked);
+      return strdup(refusal);
    }
 
    /* Default: reinvoke_parent — bring the result back into THIS conversation and
@@ -113,8 +122,15 @@ static char *handle_spawn(struct json_object *details,
       deliver_to = NULL; /* ignore empty / suspicious delivery target */
    }
 
+   /* The job runs on the LLM of the turn that started it (checked when that
+    * turn began). */
+   session_llm_config_t llm;
+   job_selection_of_spawner(&llm);
+   conv_llm_columns_t llm_cols;
+   job_selection_columns(&llm, &llm_cols);
+
    /* Refuse cleanly past a running cap before creating any row. */
-   job_provider_class_t provider = job_provider_from_default();
+   job_provider_class_t provider = job_provider_for(&llm);
    int cap = job_manager_capacity(user_id, provider);
    if (cap != JOB_MGR_OK) {
       const char *why = (cap == JOB_MGR_CAP_GLOBAL) ? "the system is at its background-job limit"
@@ -136,7 +152,8 @@ static char *handle_spawn(struct json_object *details,
 
    int64_t conv_id = 0;
    if (conv_db_create_job_ex(user_id, title, parent_conv, "detached", on_complete, deliver_to, 1,
-                             goal, job_spawn_origin_string(), &conv_id) != AUTH_DB_SUCCESS) {
+                             goal, job_spawn_origin_string(), &llm_cols,
+                             &conv_id) != AUTH_DB_SUCCESS) {
       return strdup(TOOL_RESULT_ERROR_MARK "Error: failed to create the background job.");
    }
 
@@ -285,7 +302,8 @@ static char *handle_resume(struct json_object *details, int user_id) {
                     "Error: 'job_id' is required to resume a background job.");
    }
 
-   char buf[192];
+   char buf[LLM_SELECTION_REASON_MAX + 96];
+   char refused[LLM_SELECTION_REASON_MAX] = "";
    /* Same one mutation path the WebUI uses — including the ownership check, so
     * a job_id belonging to someone else is refused here too.
     *
@@ -293,7 +311,7 @@ static char *handle_resume(struct json_object *details, int user_id) {
     * a reinvoke turn whose content came from untrusted job output, so it must
     * not be able to restart a job the user cancelled.  A person wanting that
     * clicks Resume in the panel. */
-   switch (job_worker_resume(conv_id, user_id, JOB_RESUME_ORIGIN_TOOL)) {
+   switch (job_worker_resume(conv_id, user_id, JOB_RESUME_ORIGIN_TOOL, refused, sizeof(refused))) {
       case JOB_RESUME_STARTED:
          snprintf(buf, sizeof(buf),
                   "Resuming background job #%lld — it'll pick up where it left off.",
@@ -318,6 +336,10 @@ static char *handle_resume(struct json_object *details, int user_id) {
       case JOB_RESUME_CAPACITY:
          return strdup(TOOL_RESULT_ERROR_MARK
                        "Too many jobs are running right now — try resuming it again shortly.");
+      case JOB_RESUME_NOT_RUNNABLE:
+         snprintf(buf, sizeof(buf), TOOL_RESULT_ERROR_MARK "Can't resume job #%lld. %s",
+                  (long long)conv_id, refused);
+         return strdup(buf);
       case JOB_RESUME_FAILED:
          snprintf(buf, sizeof(buf), TOOL_RESULT_ERROR_MARK "Couldn't restart job #%lld.",
                   (long long)conv_id);
@@ -423,23 +445,27 @@ static char *job_tool_callback(const char *action, char *value, int *should_resp
     * dispatch chain and silently miss them. */
    const bool starts_work = (strcmp(action, "spawn") == 0 || strcmp(action, "resume") == 0);
 
-   /* No caller context means no session to attribute this to.  Every other path
-    * (LLM tool call, legacy <command> tag) sets it; the one that does not is an
-    * MQTT publish, which is UNAUTHENTICATED on a broker without auth/TLS and
-    * would otherwise run as user_id 1 with the fan-out backstop wide open.
-    * Reads stay available (they are already user-scoped and harmless); anything
-    * that starts work fails closed. */
-   if (ctx == NULL && starts_work) {
+   /* No caller context means no session to attribute this to.  An LLM tool call
+    * (llm_tools.c) and a direct voice command (dawn.c, around run_direct_command)
+    * set it, and the scheduler can't reach this tool (not schedulable); the one
+    * caller with none is an MQTT publish that names no live session
+    * (mosquitto_comms.c), UNAUTHENTICATED on a broker without auth/TLS, which
+    * would otherwise run as the default voice user with the fan-out backstop
+    * wide open.
+    * Every action fails closed, reads included: `list` and `status` would show
+    * that user's jobs and their results to the publisher, and `cancel` would stop
+    * them. */
+   if (ctx == NULL) {
       json_object_put(details);
       OLOG_WARNING("job_tool: refused '%s' from a caller with no session context", action);
       return strdup(TOOL_RESULT_ERROR_MARK
-                    "Error: background jobs can only be started from a user session.");
+                    "Error: background jobs can only be used from a user session.");
    }
 
    /* Backstop: a background-job worker runs headless and must never start further
     * jobs (unbounded fan-out).  The `job` tool is already removed from a job
-    * session's schema, so the model shouldn't see it; this refuses any non-schema
-    * path (e.g. a legacy <command> tag) that reaches it from a job context.
+    * session's schema, so the model shouldn't see it; this refuses any path that
+    * doesn't go through the schema and reaches it from a job context.
     *
     * `resume` counts: it takes a pool slot and spawns a worker exactly like
     * spawn does, so leaving it out would reopen the fan-out this closes — via a
