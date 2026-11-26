@@ -1,5 +1,21 @@
 # Power telemetry validation
 
+## Synced upstream integration — 2026-11-25
+
+Integrated upstream `04a25f2c` with the versioned Backpack bridge and companion runtime on `codex/backpack-upstream-20261125`. The deployed product-code commit is `a6032875`. The six previously untracked Dawn files and the companion deployment/test sources are now committed.
+
+The native ARM64/CUDA Release candidate and the build in the deployed workspace passed, including the build-time source invariants. The Backpack harness passed 36 telemetry tests (one existing ignored case), 12 attention tests, the native acknowledgment/fake-socket collector, and all 78 Python tests. The WebUI-enabled CI test build completed: 264 suites passed initially; the remaining document-extraction suite passed after its MIME expectations were made conditional on compiled PDF/DOCX support. Thus all 265 selected CI suites passed across the run and the focused rerun. Two GCC truncation failures were also corrected: the repository-import confirmation wording and bounded test-failure excerpts.
+
+A separate network namespace kept the candidate's HTTP listener and abstract admin socket isolated from the running daemon. Against copies of the actual databases, the final candidate migrated auth schema to v117 and preserved the original account/password-hash records. Generated test credentials stayed in memory and applied only to the copied database. Checks passed for invalid-password rejection, successful HTTPS login, Secure/HttpOnly/SameSite cookies, authenticated UI/session status, administrator-only Backpack access, and non-admin rejection. No real operator password was requested or reset.
+
+Chromium checked the merged wrapping header at widths 320, 375, 393, 402, 430, 480, 500 and 600 pixels with optional controls visible. WebKit checked the 402-pixel mobile layout. No toolbar controls extended beyond the viewport. Scoped clang-format-14 and Prettier checks, companion Python syntax checks, a GCC analyzer run on the C bridge, and focused secret-pattern/source review passed. The npm lockfile audit reported no advisories. The pinned clang-tidy tool, CodeQL, sanitizer builds and physical microphone/camera/drone/radio tests were not run in this task; optional PDF/DOCX extraction cases remain skipped when their libraries are absent.
+
+Private pre-upgrade source, binaries, configuration, units, certificates and consistent database snapshots were retained under `run/upstream-integration-20261125-before`. A fresh checkpoint with DAWN stopped is under `run/upstream-integration-20261125-final`; its `source-recovery.json` records the original branch and source stash. The live configuration and companion service code were preserved. The running service reports `a6032875`, auth schema is v117, account records/configuration compare unchanged, and music/queue databases pass SQLite integrity checks. DAWN and its runtime, MQTT, simulator and Meshtastic adapter services are active; DAWN reported zero automatic restarts at acceptance. LAN HTTPS login returns HTTP 200, while unauthenticated Backpack API access redirects to login.
+
+For rollback, stop DAWN before restoring its matching source/binary and auth/music snapshots. Preserve post-upgrade data separately first. Do not restore the independently running Backpack/STAT databases while their writers remain active. See [integration and recovery guidance](INTEGRATION.md).
+
+
+
 ## Unified events and restart continuity — 2026-11-23
 
 Implemented the [event and continuity contract](EVENTS.md): additive SQLite event tables,
