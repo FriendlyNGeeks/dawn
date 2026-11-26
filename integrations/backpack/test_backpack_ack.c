@@ -1,11 +1,11 @@
 /* Link the actual native acknowledgment path; speech is replaced by a collector. */
 #include <assert.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -114,8 +114,10 @@ static void check_startup_handoff(void) {
    rmdir(directory);
 }
 
-static void check_recon_response(const char *action, const char *operation,
-                                 const char *reply, const char *expected) {
+static void check_recon_response(const char *action,
+                                 const char *operation,
+                                 const char *reply,
+                                 const char *expected) {
    char directory[] = "/tmp/backpack-recon-test.XXXXXX";
    assert(mkdtemp(directory));
    struct sockaddr_un address = { .sun_family = AF_UNIX };
@@ -187,8 +189,9 @@ int main(void) {
    assert(backpack_drone_action("pull up the drone feed") == NULL);
    assert(draws == 0);
    static const char *const expected[] = {
-      "Checking that now.", "Taking a look.", "On it.", "Let me check.",
-      "One moment.", "Let me look into that.", "I'll check the details.", "Give me a moment."
+      "Checking that now.",      "Taking a look.",   "On it.",
+      "Let me check.",           "One moment.",      "Let me look into that.",
+      "I'll check the details.", "Give me a moment."
    };
    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
       backpack_acknowledge_request(i % 2 ? "Are you seeing this?" : "What is the memory usage?");
@@ -200,15 +203,22 @@ int main(void) {
    backpack_acknowledge_request(NULL);
    assert(calls == 8 && draws == 8);
    check_recon_response("start", "drone_start",
-      "{\"description\":\"Ready\",\"source\":\"goggles3\",\"fresh\":true}\n", "Ready");
+                        "{\"description\":\"Ready\",\"source\":\"goggles3\",\"fresh\":true}\n",
+                        "Ready");
    check_recon_response("start", "drone_start",
-      "{\"description\":\"Ready\",\"source\":\"goggles3\",\"fresh\":false}\n", "couldn't");
-   check_recon_response("stop", "drone_stop",
-      "{\"description\":\"Recon terminated\",\"source\":\"goggles3\",\"fresh\":false}\n", "terminated");
-   check_recon_response("status", "drone_status",
-      "{\"description\":\"Recon stopped\",\"source\":\"goggles3\",\"fresh\":false}\n", "stopped");
+                        "{\"description\":\"Ready\",\"source\":\"goggles3\",\"fresh\":false}\n",
+                        "couldn't");
+   check_recon_response(
+       "stop", "drone_stop",
+       "{\"description\":\"Recon terminated\",\"source\":\"goggles3\",\"fresh\":false}\n",
+       "terminated");
+   check_recon_response(
+       "status", "drone_status",
+       "{\"description\":\"Recon stopped\",\"source\":\"goggles3\",\"fresh\":false}\n", "stopped");
    check_recon_response("describe", "drone_describe",
-      "{\"description\":\"Wrong source\",\"source\":\"camera\",\"fresh\":true}\n", "couldn't");
-   puts("All eight random cue selections and suppression cases passed; no real speech or host actions.");
+                        "{\"description\":\"Wrong source\",\"source\":\"camera\",\"fresh\":true}\n",
+                        "couldn't");
+   puts("All eight random cue selections and suppression cases passed; no real speech or host "
+        "actions.");
    return 0;
 }

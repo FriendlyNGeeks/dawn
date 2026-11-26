@@ -1419,11 +1419,11 @@ void *llm_worker_thread(void *arg) {
    // it wait for the turn to end).
    // Vision is handled by native tool calling - viewing tool captures image internally
    struct json_object *history = interrupted || !can_run ? NULL
-                                                       : session_get_turn_history(local_session);
+                                                         : session_get_turn_history(local_session);
    const bool camera_request = history && backpack_camera_is_request(request_text);
    const char *drone_action = history ? backpack_drone_action(request_text) : NULL;
    const bool direct_vision = camera_request || drone_action;
-   char *response = drone_action ? backpack_drone_request(drone_action, request_text)
+   char *response = drone_action     ? backpack_drone_request(drone_action, request_text)
                     : camera_request ? backpack_camera_describe(request_text)
                     : history
                         ? llm_chat_completion_streaming_tts_with_config(history, request_text,

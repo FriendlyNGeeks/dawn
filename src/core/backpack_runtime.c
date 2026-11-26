@@ -203,13 +203,13 @@ const char *backpack_drone_action(const char *text) {
       }
    }
    if (!action && (!strcmp(phrase, "what on the eye in the sky") ||
-            !strcmp(phrase, "whats on the eye in the sky") ||
-            !strcmp(phrase, "whats on the iron sky") ||
-            !strcmp(phrase, "what is on the eye in the sky") ||
-            !strcmp(phrase, "what is in the eye in the sky") ||
-            !strcmp(phrase, "describe the drone view") ||
-            !strcmp(phrase, "what is in the drone feed") ||
-            !strcmp(phrase, "what do you see in the drone feed")))
+                   !strcmp(phrase, "whats on the eye in the sky") ||
+                   !strcmp(phrase, "whats on the iron sky") ||
+                   !strcmp(phrase, "what is on the eye in the sky") ||
+                   !strcmp(phrase, "what is in the eye in the sky") ||
+                   !strcmp(phrase, "describe the drone view") ||
+                   !strcmp(phrase, "what is in the drone feed") ||
+                   !strcmp(phrase, "what do you see in the drone feed")))
       action = "describe";
    free(normalized);
    return action;
@@ -223,17 +223,22 @@ char *backpack_drone_request(const char *action, const char *query) {
       return strdup("Use start, stop, status or describe for ASTRA.");
    struct json_object *request = json_object_new_object();
    json_object_object_add(request, "operation",
-                          json_object_new_string(start ? "drone_start" : stop ? "drone_stop"
-                                                 : status ? "drone_status" : "drone_describe"));
+                          json_object_new_string(start    ? "drone_start"
+                                                 : stop   ? "drone_stop"
+                                                 : status ? "drone_status"
+                                                          : "drone_describe"));
    json_object_object_add(request, "query",
                           json_object_new_string(query ? query : "What is in the drone feed?"));
-   struct json_object *result = runtime_request(request, start ? 55 : stop ? 65 : status ? 15 : 105);
+   struct json_object *result = runtime_request(request, start    ? 55
+                                                         : stop   ? 65
+                                                         : status ? 15
+                                                                  : 105);
    struct json_object *description, *fresh, *source, *error;
    char *text;
    if (result && json_object_object_get_ex(result, "description", &description) &&
        json_object_is_type(description, json_type_string) &&
-       ((stop || status) || (json_object_object_get_ex(result, "fresh", &fresh) &&
-                             json_object_get_boolean(fresh))) &&
+       ((stop || status) ||
+        (json_object_object_get_ex(result, "fresh", &fresh) && json_object_get_boolean(fresh))) &&
        json_object_object_get_ex(result, "source", &source) &&
        json_object_is_type(source, json_type_string) &&
        !strcmp(json_object_get_string(source), "goggles3")) {
@@ -748,27 +753,42 @@ int backpack_camera_tool_register(void) {
 
 int backpack_drone_tool_register(void) {
    static const treg_param_t params[] = {
-      { .name = "action", .description = "Start recon, terminate it, report status, or describe a fresh frame.",
-        .type = TOOL_PARAM_TYPE_ENUM, .required = true, .maps_to = TOOL_MAPS_TO_ACTION,
-        .enum_values = { "start", "stop", "status", "describe" }, .enum_count = 4 },
-      { .name = "query", .description = "Question about the drone or eye in the sky feed.",
-        .type = TOOL_PARAM_TYPE_STRING, .maps_to = TOOL_MAPS_TO_VALUE }
+      { .name = "action",
+        .description = "Start recon, terminate it, report status, or describe a fresh frame.",
+        .type = TOOL_PARAM_TYPE_ENUM,
+        .required = true,
+        .maps_to = TOOL_MAPS_TO_ACTION,
+        .enum_values = { "start", "stop", "status", "describe" },
+        .enum_count = 4 },
+      { .name = "query",
+        .description = "Question about the drone or eye in the sky feed.",
+        .type = TOOL_PARAM_TYPE_STRING,
+        .maps_to = TOOL_MAPS_TO_VALUE }
    };
    static const tool_metadata_t metadata = {
-      .name = "astra", .device_string = "astra", .topic = "dawn",
-      .description = "ASTRA is the aerial surveillance and reconnaissance workflow. "
-                     "Its only mode/status keyword aliases are recon and Icarus. "
-                     "Use start for start/initiate ASTRA (optionally mode): starts YOLO "
-                     "and headless LiveView, verifies fresh video and inference before reporting ready. "
-                     "Use stop for stop/terminate ASTRA: stops capture and unloads YOLO. "
-                     "Use status for ASTRA status or stats, including sampling and inference rates. "
-                     "ArduPilot is not configured. Use describe for eye in the "
-                     "sky or drone scene questions: analyzes a new frame from the live goggles "
-                     "feed. Never uses the backpack camera or stale frames. PiP pauses sharing.",
-      .results = TOOL_RESULTS_OWN, .default_kind = TOOL_KIND_ACT, .params = params,
-      .param_count = TOOL_PARAM_COUNT(params), .device_type = TOOL_DEVICE_TYPE_GETTER,
-      .skip_followup = true, .default_local = false, .default_remote = false,
-      .is_available = available, .callback = drone_callback
+      .name = "astra",
+      .device_string = "astra",
+      .topic = "dawn",
+      .description =
+          "ASTRA is the aerial surveillance and reconnaissance workflow. "
+          "Its only mode/status keyword aliases are recon and Icarus. "
+          "Use start for start/initiate ASTRA (optionally mode): starts YOLO "
+          "and headless LiveView, verifies fresh video and inference before reporting ready. "
+          "Use stop for stop/terminate ASTRA: stops capture and unloads YOLO. "
+          "Use status for ASTRA status or stats, including sampling and inference rates. "
+          "ArduPilot is not configured. Use describe for eye in the "
+          "sky or drone scene questions: analyzes a new frame from the live goggles "
+          "feed. Never uses the backpack camera or stale frames. PiP pauses sharing.",
+      .results = TOOL_RESULTS_OWN,
+      .default_kind = TOOL_KIND_ACT,
+      .params = params,
+      .param_count = TOOL_PARAM_COUNT(params),
+      .device_type = TOOL_DEVICE_TYPE_GETTER,
+      .skip_followup = true,
+      .default_local = false,
+      .default_remote = false,
+      .is_available = available,
+      .callback = drone_callback
    };
    return tool_registry_register(&metadata);
 }

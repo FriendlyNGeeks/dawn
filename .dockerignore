@@ -19,6 +19,9 @@ dawn.key
 ssl/
 .env
 .env.*
+!.env.example
+secret.agent.env
+integrations/backpack/run/
 
 # Satellite (separate build target)
 dawn_satellite/

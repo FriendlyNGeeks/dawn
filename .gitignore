@@ -8,6 +8,11 @@ benchmarks/snapshots*/
 # Runtime config files (user-specific, may contain secrets)
 dawn.toml
 secrets.toml
+.env
+.env.*
+!.env.example
+secret.agent.env
+integrations/backpack/run/
 
 # Debug recordings
 aec_*.wav
