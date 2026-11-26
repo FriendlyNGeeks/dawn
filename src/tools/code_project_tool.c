@@ -409,7 +409,7 @@ static char *cp_add_request(int64_t uid, const char *value, const turn_origin_t 
    char which[CODE_PROJECT_BRANCH_MAX + 32];
    cp_branch_phrase(branch, from_url, which, sizeof(which));
    snprintf(msg, sizeof(msg),
-            "Ready to add %s (%s) as the code project '%s': DAWN will clone it and index it into "
+            "Ready to add %s (%s) as project '%s': DAWN will clone it and index it into "
             "the code graph, visible to this user only. Nothing has been cloned yet. Ask the user "
             "to confirm; if they say yes in their reply, call code_project with action "
             "'confirm_add' and pending_id %u (this import only).",
