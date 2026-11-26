@@ -9,6 +9,7 @@
 
 ### Bug Fixes
 
+- Bounded test-failure diagnostic excerpts so long inputs compile with GCC truncation warnings treated as errors.
 - Shortened the repository-import confirmation to fit its bounded buffer and compile with GCC's truncation warnings treated as errors.
 - Integrated synced upstream main while preserving local model tool filtering, Ollama reasoning controls and administrator-only Backpack status.
 - Combined upstream mobile focus-ring spacing with the wrapping two-row header at widths up to 600 pixels.

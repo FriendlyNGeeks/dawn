@@ -52,7 +52,7 @@ static inline const char *test_fact_missing(const char *text,
                                          (ordered));                                          \
       if (m_ != NULL) {                                                                       \
          static char msg_[4096];                                                              \
-         snprintf(msg_, sizeof(msg_), "%s \"%s\" in: %s",                                     \
+         snprintf(msg_, sizeof(msg_), "%s \"%.512s\" in: %.3500s",                            \
                   (ordered) ? "missing or out of order" : "missing", m_, t_ ? t_ : "(null)"); \
          TEST_FAIL_MESSAGE(msg_);                                                             \
       }                                                                                       \
