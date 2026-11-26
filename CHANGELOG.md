@@ -1,0 +1,13 @@
+# Changelog
+
+## 2026-11-25
+
+### New Features
+
+- Added the optional Jetson Backpack runtime bridge, companion services, deployment configuration and focused integration validation.
+- Preserved Victor engagement, simulated dual-battery telemetry, confirmed host actions, camera/ASTRA workflows and durable event continuity.
+
+### Bug Fixes
+
+- Integrated synced upstream main while preserving local model tool filtering, Ollama reasoning controls and administrator-only Backpack status.
+- Combined upstream mobile focus-ring spacing with the wrapping two-row header at widths up to 600 pixels.

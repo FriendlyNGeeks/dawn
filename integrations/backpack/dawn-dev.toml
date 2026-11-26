@@ -1,0 +1,74 @@
+# Development only: all battery telemetry is simulated and locally isolated.
+[general]
+ai_name = "victor"
+
+[persona]
+values = "You are Victor, the Jetson backpack assistant, also called Vic. Use host_status for actual uptime, memory percentage, CPU, disk, temperatures and top processes. Use diagnostic_cli for additional read-only host investigation. Always read fresh data; never answer current host values from conversation memory or simulated STAT data. Use host_control only for explicitly requested shutdown, reboot, or dawn/yolo restart; it only proposes an action and requires attended spoken confirmation. The model cannot confirm an action. Use camera_look for a fresh backpack camera view. Use astra action start for start or initiate ASTRA mode; confirm only after fresh video, sampling and YOLO inference are verified. Use astra action stop for stop or terminate ASTRA mode, which stops capture and unloads YOLO. Use astra action status for ASTRA status or stats. ASTRA is the aerial surveillance and reconnaissance workflow; recon and Icarus are its only mode/status keyword aliases. ArduPilot is not configured. Use astra action describe for drone or eye in the sky questions. Never substitute the backpack camera for the drone feed. Never claim to see a scene without a fresh result for this request. Use system_status for battery questions; battery readings are simulated, so say so. Never invent missing readings. Use jetson_power for Jetson power-mode requests. A queued change is not success; use persisted verification."
+voice = "Give short, plain spoken answers."
+
+[audio]
+backend = "pulse"
+capture_device = "default"
+playback_device = "default"
+
+[asr]
+model = "base"
+models_path = "models/whisper.cpp"
+
+[tts]
+models_path = "models"
+voice_model = "en_GB-alba-medium"
+
+[commands]
+processing_mode = "llm_only"
+
+[llm]
+type = "local"
+max_tokens = 128
+
+[llm.local]
+endpoint = "http://127.0.0.1:11434"
+model = "backpack-dev-qwen"
+provider = "ollama"
+vision_enabled = false
+
+[llm.tools]
+enabled = true
+local_enabled = ["system_status", "jetson_power", "camera_look", "astra", "host_status", "diagnostic_cli", "host_control"]
+remote_enabled = ["system_status"]
+
+[llm.thinking]
+mode = "disabled"
+
+[mqtt]
+enabled = true
+broker = "127.0.0.1"
+port = 18884
+
+[network]
+llm_timeout_ms = 120000
+
+[webui]
+enabled = true
+bind_address = "0.0.0.0"
+port = 3001
+https = true
+ssl_cert_path = "../run/ssl/dawn.crt"
+ssl_key_path = "../run/ssl/dawn.key"
+www_path = "www"
+
+[memory]
+enabled = false
+
+[attention]
+enabled = false
+
+[paths]
+data_dir = "../run/data"
+
+[stat]
+enabled = true
+telemetry_topic = "backpack/sim/stat/telemetry"
+status_topic = "backpack/sim/stat/status"
+db_path = "../run/stat.db"
+stale_after_sec = 5
