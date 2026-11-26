@@ -27,8 +27,49 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "logging.h"
+
+const char *wake_word_name_mention(const char *text, const char *name) {
+   if (!text || !name || !*name) {
+      return NULL;
+   }
+   size_t length = strlen(name);
+   for (const char *p = text; *p; p++) {
+      if (p != text && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) {
+         continue;
+      }
+      size_t i = 0;
+      while (i < length && p[i] &&
+             tolower((unsigned char)p[i]) == tolower((unsigned char)name[i])) {
+         i++;
+      }
+      if (i == length && !isalnum((unsigned char)p[i]) && p[i] != '_') {
+         return p;
+      }
+   }
+   /* Only the local engagement/name-mention API gets this nickname. The
+    * prefix-only authorization matcher keeps its configured-name policy. */
+   if (!strcasecmp(name, "victor")) {
+      return wake_word_name_mention(text, "vic");
+   }
+   return NULL;
+}
+
+bool wake_word_window_accept(wake_word_window_t *window,
+                             const char *text,
+                             const char *name,
+                             double now) {
+   if (!window) {
+      return false;
+   }
+   if (wake_word_name_mention(text, name)) {
+      window->engaged = true;
+      window->last_mention = now;
+   }
+   return window->engaged && now >= window->last_mention && now - window->last_mention < 120.0;
+}
 
 /* Wake word prefixes combined with ai_name at runtime */
 static const char *s_wake_prefixes[] = { "hello ",    "okay ",         "alright ",

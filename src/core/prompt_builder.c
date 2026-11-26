@@ -383,8 +383,22 @@ static char *build_directives(session_t *dispatch) {
    const bool is_remote = dispatch == NULL || dispatch->type != SESSION_TYPE_LOCAL;
    if (llm_tools_enabled(NULL)) {
       char hint[2048];
-      if (llm_tools_build_disabled_hint(is_remote, hint, sizeof(hint)) > 0)
+      session_llm_config_t config = { 0 };
+      if (dispatch != NULL)
+         session_get_llm_config(dispatch, &config);
+      llm_resolved_config_t resolved;
+      const bool local_model = llm_resolve_config(&config, &resolved) == 0 &&
+                               resolved.type == LLM_LOCAL;
+      if (local_model) {
+         /* Local requests omit tools this session cannot execute. A long list
+          * of absent features both wastes their smaller context and can make
+          * a model misclassify a related, available tool as disabled. */
+         set = add_directive(set, "The tools supplied with this request are available for this "
+                                  "session. Use them for current readings; do not infer that an "
+                                  "available tool is disabled because another feature is absent.");
+      } else if (llm_tools_build_disabled_hint(is_remote, hint, sizeof(hint)) > 0) {
          set = add_directive(set, hint);
+      }
       /* What the helmet offers now (the HUD tools' schemas name no values). */
       if (hud_discovery_describe(hint, sizeof(hint)) > 0)
          set = add_directive(set, hint);

@@ -104,3 +104,73 @@ void stat_render_network(const stat_snapshot_t *s, char *buf, size_t sz) {
       snprintf(buf + off, sz - off, "(Some interfaces/routes/probes omitted.) ");
    }
 }
+
+static void fmt_duration_min(double minutes, char *out, size_t out_sz) {
+   /* Upper-bound the cast: a huge (finite) time_remaining_min from a misbehaving
+    * publisher would make (int)(minutes+0.5) an out-of-range double->int (UB).
+    * 10,000,000 min (~19 years) is well past any real battery runtime. */
+   if (minutes <= 0 || minutes > 10000000.0) {
+      snprintf(out, out_sz, "unknown");
+      return;
+   }
+   int total = (int)(minutes + 0.5);
+   int h = total / 60, m = total % 60;
+   if (h > 0) {
+      snprintf(out, out_sz, "%dh %dm", h, m);
+   } else {
+      snprintf(out, out_sz, "%dm", m);
+   }
+}
+
+/* Append a battery description to buf (bounded). */
+void stat_render_battery(const stat_snapshot_t *s, char *buf, size_t sz) {
+   size_t off = strlen(buf);
+   if (!s->have_battery || s->battery_stale || !s->stat_online) {
+      snprintf(buf + off, sz - off, "Battery data unavailable%s (last battery sample %ds ago). ",
+               s->have_battery ? "/stale" : "", s->battery_age_sec);
+      return;
+   }
+   if (s->battery_simulated) {
+      snprintf(buf + off, sz - off, "SIMULATED battery telemetry. ");
+   }
+   char remain[32];
+   fmt_duration_min(s->time_remaining_min, remain, sizeof(remain));
+   char health[160];
+   const char *st = s->battery_status[0] ? s->battery_status : "unknown";
+   if (s->crit_faults > 0 || s->warn_faults > 0) {
+      snprintf(health, sizeof(health), "health %s (%d critical, %d warning)%s%s", st,
+               s->crit_faults, s->warn_faults, s->status_reason[0] ? ": " : "", s->status_reason);
+   } else {
+      snprintf(health, sizeof(health), "health %s", st);
+   }
+   off = strlen(buf);
+   snprintf(buf + off, sz - off, "Battery %.0f%% (%.1f V, %.2f A, %.1f W)%s%s, ~%s remaining, %s. ",
+            s->batt_level, s->batt_voltage, s->batt_current, s->batt_power,
+            s->charging_state[0] ? ", " : "", s->charging_state, remain, health);
+   for (int i = 0; i < s->battery_pack_count && i < STAT_BATTERY_MAX_PACKS; i++) {
+      const stat_battery_pack_t *p = &s->battery_packs[i];
+      off = strlen(buf);
+      if (!p->present) {
+         snprintf(buf + off, sz - off, "Slot %s: removed. ", p->id);
+      } else {
+         snprintf(buf + off, sz - off, "Slot %s: %.0f%%, %.1f V, %.2f A, %.1f W, %.1f C (%s). ",
+                  p->id, p->level, p->voltage, p->current, p->power, p->temperature,
+                  p->supplying ? "supplying" : "standby");
+      }
+   }
+}
+
+/* Short local speech uses the same freshness contract as the full tool. */
+void stat_render_battery_brief(const stat_snapshot_t *s, char *buf, size_t sz) {
+   if (!s->ever_seen || !s->stat_online || s->stale || !s->have_battery || s->battery_stale) {
+      snprintf(buf, sz, "Current battery data is unavailable or stale.");
+      return;
+   }
+   const char *health = s->crit_faults > 0 || !strcmp(s->battery_status, "CRITICAL")
+                            ? " Critical battery warning."
+                        : s->warn_faults > 0 || !strcmp(s->battery_status, "WARNING")
+                            ? " Battery warning."
+                            : "";
+   snprintf(buf, sz, "%sBattery is at %.0f percent.%s",
+            s->battery_simulated ? "Simulated reading. " : "", s->batt_level, health);
+}

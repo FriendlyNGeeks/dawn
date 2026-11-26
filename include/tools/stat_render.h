@@ -39,4 +39,10 @@
  */
 void stat_render_network(const stat_snapshot_t *s, char *buf, size_t sz);
 
+/** Append aggregate and optional per-slot battery status; never present stale values as live. */
+void stat_render_battery(const stat_snapshot_t *s, char *buf, size_t sz);
+
+/* Overwrite with a concise, freshness-checked local spoken battery summary. */
+void stat_render_battery_brief(const stat_snapshot_t *s, char *buf, size_t sz);
+
 #endif /* STAT_RENDER_H */

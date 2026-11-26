@@ -404,6 +404,49 @@ static void test_prefix_does_not_set_goodbye_flags(void) {
  * Main
  * ============================================================================ */
 
+static void test_local_engagement_window(void) {
+   wake_word_window_t window = { 0 };
+   TEST_ASSERT_FALSE(wake_word_window_accept(&window, "Battery status", "friday", 10));
+   TEST_ASSERT_TRUE(wake_word_window_accept(&window, "FRIDAY, battery status", "friday", 20));
+   TEST_ASSERT_TRUE(wake_word_window_accept(&window, "And slot B?", "friday", 139.999));
+   TEST_ASSERT_EQUAL_INT(20, (int)window.last_mention);
+   TEST_ASSERT_FALSE(wake_word_window_accept(&window, "Battery status", "friday", 140));
+   TEST_ASSERT_FALSE(wake_word_window_accept(&window, "Battery status", "friday", 200));
+   TEST_ASSERT_TRUE(wake_word_window_accept(&window, "Thanks, Friday!", "friday", 210));
+   TEST_ASSERT_TRUE(wake_word_window_accept(&window, "Battery status", "friday", 329));
+   TEST_ASSERT_FALSE(wake_word_window_accept(&window, "Battery status", "friday", 330));
+}
+
+static void test_local_engagement_name_boundaries(void) {
+   wake_word_window_t window = { 0 };
+   TEST_ASSERT_NULL(wake_word_name_mention("Fridayish", "friday"));
+   TEST_ASSERT_NULL(wake_word_name_mention("notfriday", "friday"));
+   TEST_ASSERT_NULL(wake_word_name_mention("friday_thing", "friday"));
+   TEST_ASSERT_NULL(wake_word_name_mention(NULL, "friday"));
+   TEST_ASSERT_NULL(wake_word_name_mention("Friday", ""));
+   TEST_ASSERT_NOT_NULL(wake_word_name_mention("Ask Friday, please", "friday"));
+   TEST_ASSERT_FALSE(wake_word_window_accept(&window, "Fridayish", "friday", 1));
+   TEST_ASSERT_TRUE(wake_word_window_accept(&window, "Friday", "friday", 2));
+   TEST_ASSERT_FALSE(wake_word_window_accept(&window, "test", "friday", 1));
+}
+
+static void test_local_vic_nickname(void) {
+   wake_word_window_t window = { 0 };
+   TEST_ASSERT_TRUE(wake_word_window_accept(&window, "Vic, are you seeing this?", "victor", 10));
+   TEST_ASSERT_TRUE(wake_word_window_accept(&window, "And now?", "victor", 129.9));
+   TEST_ASSERT_FALSE(wake_word_window_accept(&window, "And now?", "victor", 130));
+   TEST_ASSERT_NOT_NULL(wake_word_name_mention("VIC!", "Victor"));
+   TEST_ASSERT_NOT_NULL(wake_word_name_mention("Victor, look", "victor"));
+   TEST_ASSERT_NULL(wake_word_name_mention("victory", "victor"));
+   TEST_ASSERT_NULL(wake_word_name_mention("advice", "victor"));
+   TEST_ASSERT_NULL(wake_word_name_mention("vic_thing", "victor"));
+   TEST_ASSERT_NULL(wake_word_name_mention("Vic", "friday"));
+   wake_word_init("victor");
+   TEST_ASSERT_FALSE(wake_word_check_prefix("Hey Vic, look").detected);
+   TEST_ASSERT_TRUE(wake_word_check_prefix("Hey Victor, look").detected);
+   wake_word_init("friday");
+}
+
 int main(void) {
    /* Initialize with "friday" as the AI name */
    wake_word_init("friday");
@@ -469,5 +512,8 @@ int main(void) {
    RUN_TEST(test_prefix_whitespace_only);
    RUN_TEST(test_prefix_does_not_set_goodbye_flags);
 
+   RUN_TEST(test_local_engagement_window);
+   RUN_TEST(test_local_engagement_name_boundaries);
+   RUN_TEST(test_local_vic_nickname);
    return UNITY_END();
 }

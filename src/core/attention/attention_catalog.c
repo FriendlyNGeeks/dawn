@@ -35,7 +35,8 @@
 /* --- readers: fill *value, return true if the value is present --- */
 
 static bool read_battery_soc(const attention_sample_ctx_t *ctx, double *value) {
-   if (!ctx->stat_valid || !ctx->stat.have_battery) {
+   if (!ctx->stat_valid || !ctx->stat.stat_online || ctx->stat.battery_stale ||
+       !ctx->stat.have_battery) {
       return false;
    }
    *value = ctx->stat.batt_level;
@@ -67,7 +68,8 @@ static bool read_memory_usage(const attention_sample_ctx_t *ctx, double *value) 
 }
 
 static bool read_batt_temp(const attention_sample_ctx_t *ctx, double *value) {
-   if (!ctx->stat_valid || !ctx->stat.have_battery) {
+   if (!ctx->stat_valid || !ctx->stat.stat_online || ctx->stat.battery_stale ||
+       !ctx->stat.have_battery) {
       return false;
    }
    *value = ctx->stat.batt_temp;
@@ -75,7 +77,8 @@ static bool read_batt_temp(const attention_sample_ctx_t *ctx, double *value) {
 }
 
 static bool read_batt_voltage(const attention_sample_ctx_t *ctx, double *value) {
-   if (!ctx->stat_valid || !ctx->stat.have_battery) {
+   if (!ctx->stat_valid || !ctx->stat.stat_online || ctx->stat.battery_stale ||
+       !ctx->stat.have_battery) {
       return false;
    }
    *value = ctx->stat.batt_voltage;
@@ -83,7 +86,8 @@ static bool read_batt_voltage(const attention_sample_ctx_t *ctx, double *value) 
 }
 
 static bool read_batt_current(const attention_sample_ctx_t *ctx, double *value) {
-   if (!ctx->stat_valid || !ctx->stat.have_battery) {
+   if (!ctx->stat_valid || !ctx->stat.stat_online || ctx->stat.battery_stale ||
+       !ctx->stat.have_battery) {
       return false;
    }
    *value = ctx->stat.batt_current;
@@ -91,7 +95,8 @@ static bool read_batt_current(const attention_sample_ctx_t *ctx, double *value) 
 }
 
 static bool read_batt_power(const attention_sample_ctx_t *ctx, double *value) {
-   if (!ctx->stat_valid || !ctx->stat.have_battery) {
+   if (!ctx->stat_valid || !ctx->stat.stat_online || ctx->stat.battery_stale ||
+       !ctx->stat.have_battery) {
       return false;
    }
    *value = ctx->stat.batt_power;
@@ -99,7 +104,8 @@ static bool read_batt_power(const attention_sample_ctx_t *ctx, double *value) {
 }
 
 static bool read_time_remaining(const attention_sample_ctx_t *ctx, double *value) {
-   if (!ctx->stat_valid || !ctx->stat.have_battery) {
+   if (!ctx->stat_valid || !ctx->stat.stat_online || ctx->stat.battery_stale ||
+       !ctx->stat.have_battery) {
       return false;
    }
    *value = ctx->stat.time_remaining_min;
@@ -107,7 +113,8 @@ static bool read_time_remaining(const attention_sample_ctx_t *ctx, double *value
 }
 
 static bool read_crit_faults(const attention_sample_ctx_t *ctx, double *value) {
-   if (!ctx->stat_valid || !ctx->stat.ever_seen) {
+   if (!ctx->stat_valid || !ctx->stat.stat_online || ctx->stat.battery_stale ||
+       !ctx->stat.have_battery) {
       return false;
    }
    *value = (double)ctx->stat.crit_faults;
@@ -115,7 +122,8 @@ static bool read_crit_faults(const attention_sample_ctx_t *ctx, double *value) {
 }
 
 static bool read_warn_faults(const attention_sample_ctx_t *ctx, double *value) {
-   if (!ctx->stat_valid || !ctx->stat.ever_seen) {
+   if (!ctx->stat_valid || !ctx->stat.stat_online || ctx->stat.battery_stale ||
+       !ctx->stat.have_battery) {
       return false;
    }
    *value = (double)ctx->stat.warn_faults;
@@ -270,6 +278,14 @@ static bool read_stat_age(const attention_sample_ctx_t *ctx, double *value) {
    return true;
 }
 
+static bool read_battery_age(const attention_sample_ctx_t *ctx, double *value) {
+   if (!ctx->stat_valid || !ctx->stat.have_battery) {
+      return false;
+   }
+   *value = (double)ctx->stat.battery_age_sec;
+   return true;
+}
+
 /* Network transition readers. ctx->net_present already folds in STAT freshness
  * (absent / stale / no network telemetry => not present), and the durations are
  * the dwell counters maintained idempotently in attention_ingest.c. A zero
@@ -305,6 +321,8 @@ static bool read_net_cellular_sec(const attention_sample_ctx_t *ctx, double *val
    "\xC2\xB0" \
    "C"
 static const attention_catalog_entry_t s_catalog[] = {
+   { "stat.battery.telemetry", "stat", "battery telemetry", "s", SAGE_RULE_ABSENCE, SAGE_DIR_ABOVE,
+     30.0, 0.0, 0, SAGE_NOTIFY_ALERT, read_battery_age },
    { "stat.battery.soc", "stat", "battery level", "%", SAGE_RULE_THRESHOLD, SAGE_DIR_BELOW, 15.0,
      5.0, 0, SAGE_NOTIFY_ALERT, read_battery_soc },
    { "stat.system_temp", "stat", "system temperature", DEG_C, SAGE_RULE_THRESHOLD, SAGE_DIR_ABOVE,

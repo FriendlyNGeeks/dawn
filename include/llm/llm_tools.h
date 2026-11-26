@@ -605,6 +605,13 @@ void llm_tools_result_set_content(tool_result_t *result, char *text);
  */
 bool llm_tools_request_offers(struct json_object *history, bool is_remote, const char *name);
 
+/** Local-model request schemas: preserve frozen definitions, but omit tools
+ * this session cannot execute so disabled features do not exhaust context.
+ * Returns an owned OpenAI-format array, or NULL when no tools may run. */
+struct json_object *llm_tools_request_active_openai(struct json_object *history,
+                                                    bool is_remote,
+                                                    const char **source_out);
+
 /**
  * @brief Check if follow-up LLM call should be skipped
  *

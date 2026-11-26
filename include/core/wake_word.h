@@ -114,6 +114,19 @@ wake_word_result_t wake_word_check_prefix(const char *text);
  */
 bool wake_word_is_cancel(const char *text);
 
+/* Local microphone engagement, measured using CLOCK_MONOTONIC seconds.
+ * Only a whole-word name mention renews the 120-second window. */
+typedef struct {
+   bool engaged;
+   double last_mention;
+} wake_word_window_t;
+
+const char *wake_word_name_mention(const char *text, const char *name);
+bool wake_word_window_accept(wake_word_window_t *window,
+                             const char *text,
+                             const char *name,
+                             double now);
+
 /**
  * @brief Normalize text for wake word matching
  *

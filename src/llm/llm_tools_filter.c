@@ -344,6 +344,31 @@ bool llm_tools_request_offers(struct json_object *history, bool is_remote, const
    return enabled;
 }
 
+struct json_object *llm_tools_request_active_openai(struct json_object *history,
+                                                    bool is_remote,
+                                                    const char **source_out) {
+   struct json_object *tools = llm_tools_request_tools(history, is_remote, false, false,
+                                                       source_out);
+   if (!tools) {
+      return NULL;
+   }
+   /* Only the rendered request array is edited; the conversation's frozen
+    * schemas remain intact for later turns, permission changes, and replay. */
+   for (size_t i = json_object_array_length(tools); i > 0; i--) {
+      struct json_object *tool = json_object_array_get_idx(tools, i - 1), *function, *name;
+      if (!json_object_object_get_ex(tool, "function", &function) ||
+          !json_object_object_get_ex(function, "name", &name) ||
+          !llm_tools_request_offers(history, is_remote, json_object_get_string(name))) {
+         json_object_array_del_idx(tools, i - 1, 1);
+      }
+   }
+   if (json_object_array_length(tools) == 0) {
+      json_object_put(tools);
+      return NULL;
+   }
+   return tools;
+}
+
 /* The last schema hashes computed, and the generations they are of (under
  * llm_tools_mutex): recomputed only when a tool or a schema could have
  * changed, not every turn. */

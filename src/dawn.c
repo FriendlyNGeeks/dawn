@@ -24,6 +24,7 @@
 
 /* Std C */
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <math.h>
@@ -35,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -78,6 +80,7 @@
 #include "core/job_manager.h" /* jobs run only with the WebUI (their delivery) */
 #include "core/job_reinvoke.h"
 #endif
+#include "core/backpack_runtime.h"
 #include "core/llm_response_finalize.h"
 #include "core/ocp_helpers.h"
 #include "core/ota.h"
@@ -223,6 +226,13 @@ static silero_vad_context_t *vad_ctx = NULL;
 // legacy `silence_duration >= end_of_speech_duration` timing exactly while
 // shadow-recording the tentative->resume gaps (adaptive-dwell instrumentation).
 static endpointer_t s_ww_endpointer;
+static wake_word_window_t s_voice_window;
+
+static double voice_monotonic_seconds(void) {
+   struct timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
 
 // Wake word prefixes that get combined with ai_name at runtime
 static const char *wakeWordPrefixes[] = { "hello ",    "okay ",         "alright ",
@@ -238,6 +248,7 @@ static char *wakeWords[NUM_WAKE_WORDS];
 
 // Initialize wake words from config ai_name
 static void init_wake_words(void) {
+   s_voice_window = (wake_word_window_t){ 0 };
    for (size_t i = 0; i < NUM_WAKE_WORDS; i++) {
       snprintf(wakeWordBuffers[i], WAKE_WORD_BUF_SIZE, "%s%s", wakeWordPrefixes[i],
                g_config.general.ai_name);
@@ -524,6 +535,7 @@ static void apply_local_owner_change(session_t *local) {
    const int before = session_effective_user_id(local);
    const int after = owner > 0 ? owner : session_default_voice_user_id();
    if (after != before) {
+      backpack_history_save(local);
       int64_t saved = 0;
       /* Couldn't be saved: drop it rather than hand it to the next owner. */
       if (session_save_voice_conversation(local, &saved) != 0 && session_has_messages(local)) {
@@ -533,6 +545,10 @@ static void apply_local_owner_change(session_t *local) {
                 saved > 0 ? " (previous user's conversation saved)" : "");
    }
    session_set_metrics_user(local, owner);
+   if (after != before) {
+      session_clear_history(local);
+      backpack_history_restore(local);
+   }
 }
 
 /* End the local turn (main thread): once its worker is joined, or when no
@@ -543,6 +559,7 @@ static void end_local_turn(void) {
    }
    session_set_turn_token(s_local_turn_token); /* the turn's own thread ends it */
    session_turn_end(session_get_local());
+   backpack_history_save(session_get_local());
    s_local_turn_open = false;
    s_local_turn_token = 0;
 }
@@ -1107,6 +1124,7 @@ void reset_conversation(void) {
 
    /* A new context: its first turn freezes the prompt it runs under. */
    session_clear_history(local_session);
+   backpack_history_save(local_session);
 
 
    /* Reset metrics */
@@ -1365,6 +1383,9 @@ void *llm_worker_thread(void *arg) {
    session_set_turn_token(s_local_turn_token);
 
    session_t *local_session = session_get_local();
+   if (request_text) {
+      backpack_acknowledge_request(request_text);
+   }
    /* Parity with WebUI/satellite: the turn's memory and focus context, and a
     * compaction when the history reaches its window, before the call.  Here,
     * not on the audio loop: a summary can take a while, and a barge-in must be
@@ -1394,11 +1415,23 @@ void *llm_worker_thread(void *arg) {
    // it wait for the turn to end).
    // Vision is handled by native tool calling - viewing tool captures image internally
    struct json_object *history = interrupted ? NULL : session_get_turn_history(local_session);
-   char *response = history
+   const bool camera_request = history && backpack_camera_is_request(request_text);
+   const char *drone_action = history ? backpack_drone_action(request_text) : NULL;
+   const bool direct_vision = camera_request || drone_action;
+   char *response = drone_action ? backpack_drone_request(drone_action, request_text)
+                    : camera_request ? backpack_camera_describe(request_text)
+                    : history
                         ? llm_chat_completion_streaming_tts_with_config(history, request_text,
                                                                         dawn_tts_sentence_callback,
                                                                         NULL, &resolved_config)
                         : NULL;
+   if (direct_vision && response && !llm_is_interrupt_requested()) {
+      text_to_speech(response);
+   }
+   if (direct_vision && llm_is_interrupt_requested()) {
+      free(response);
+      response = NULL;
+   }
    session_put_history(local_session, history);
    s_pending_expression[0] = '\0'; /* a tag the reply never got to speak */
    llm_cache_monitor_set_local_mic(false);
@@ -1479,6 +1512,7 @@ static void resolve_config_path(const char *raw, char *resolved, size_t resolved
  * intervals; build it then, not before.
  */
 static void main_heartbeat_tick(time_t now) {
+   backpack_watchdog_tick();
    /* OTA fleet rollout: canary/wave deadlines and deferred fan-out delivery. */
    ota_rollout_tick(now);
    /* SAGE proactive-attention heartbeat. */
@@ -2273,6 +2307,7 @@ int main(int argc, char *argv[]) {
    // The local session starts a new context: its first turn freezes the
    // prompt it runs under (session_prefix.c).
    session_clear_history(local_session);
+   backpack_history_restore(local_session);
 
    /* Storage-backed state, before MQTT and the WebUI take input: the local
     * owner, watches, interrupted jobs, OTA releases, embeddings. */
@@ -2622,7 +2657,9 @@ mqtt_disabled:
       }
 
       // Speak greeting with AEC delay calibration (uses boot greeting to measure acoustic delay)
-      tts_speak_greeting_with_calibration(timeOfDayGreeting());
+      if (backpack_should_greet()) {
+         tts_speak_greeting_with_calibration(timeOfDayGreeting());
+      }
 
       // Wait for greeting to complete before enabling barge-in
       // This prevents VAD from interrupting the greeting during calibration
@@ -2768,6 +2805,9 @@ mqtt_disabled:
          if (now != s_last_heartbeat) {
             s_last_heartbeat = now;
             main_heartbeat_tick(now);
+            if (!local_llm_busy()) {
+               backpack_notice_tick();
+            }
          }
       }
 
@@ -3481,7 +3521,11 @@ mqtt_disabled:
                   // Normalize for wake word matching (removes all punctuation)
                   char *normalized_text = normalize_wake_word_text(input_text);
 
-                  for (i = 0; i < numGoodbyeWords; i++) {
+                  const bool engaged = wake_word_window_accept(&s_voice_window, input_text,
+                                                               g_config.general.ai_name,
+                                                               voice_monotonic_seconds());
+
+                  for (i = 0; engaged && i < numGoodbyeWords; i++) {
                      if (normalized_text && strcmp(normalized_text, goodbyeWords[i]) == 0) {
                         pthread_mutex_lock(&tts_mutex);
                         if (tts_playback_state == TTS_PLAYBACK_PAUSE) {
@@ -3513,50 +3557,21 @@ mqtt_disabled:
                                              &preroll_write_pos, &preroll_valid_bytes);
                   }
 
-                  // Search for wake word in normalized text
-                  for (i = 0; i < numWakeWords; i++) {
-                     char *found_ptr = normalized_text ? strstr(normalized_text, wakeWords[i])
-                                                       : NULL;
-                     if (found_ptr != NULL) {
-                        OLOG_WARNING("Wake word detected.\n");
-
-                        // Check if LLM is currently processing - if so, interrupt it
-                        if (llm_processing) {
-                           OLOG_INFO(
-                               "Wake word detected during LLM processing - requesting interrupt");
-                           llm_request_interrupt();
-                        }
-
-                        // Calculate offset in normalized text
-                        size_t offset = found_ptr - normalized_text;
-                        size_t wakeWordLength = strlen(wakeWords[i]);
-
-                        // Find corresponding position in original text
-                        // (accounting for removed punctuation)
-                        size_t orig_offset = 0;
-                        size_t norm_offset = 0;
-                        while (norm_offset < offset && input_text[orig_offset] != '\0') {
-                           char c = input_text[orig_offset];
-                           if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                               (c >= '0' && c <= '9') || c == ' ') {
-                              norm_offset++;
-                           }
-                           orig_offset++;
-                        }
-
-                        // Advance past wake word in original text
-                        while (norm_offset < offset + wakeWordLength &&
-                               input_text[orig_offset] != '\0') {
-                           char c = input_text[orig_offset];
-                           if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                               (c >= '0' && c <= '9') || c == ' ') {
-                              norm_offset++;
-                           }
-                           orig_offset++;
-                        }
-
-                        next_char_ptr = input_text + orig_offset;
-                        break;
+                  /* A whole-word name mention wakes the local mic, without a
+                   * required greeting. Other speech is accepted only in the window. */
+                  const char *mention = wake_word_name_mention(input_text,
+                                                               g_config.general.ai_name);
+                  i = numWakeWords;
+                  if (mention) {
+                     i = 0;
+                     size_t name_length = strlen(g_config.general.ai_name);
+                     if (!strcasecmp(g_config.general.ai_name, "victor") &&
+                         !isalnum((unsigned char)mention[3]) && mention[3] != '_') {
+                        name_length = 3; /* local whole-word nickname Vic */
+                     }
+                     next_char_ptr = (char *)mention + name_length;
+                     if (llm_processing) {
+                        llm_request_interrupt();
                      }
                   }
 
@@ -3644,6 +3659,13 @@ mqtt_disabled:
                                                 &speech_duration, &recording_duration,
                                                 &preroll_write_pos, &preroll_valid_bytes);
                      }
+                  } else if (engaged && !speaking && !local_llm_busy()) {
+                     /* Follow-ups use the full utterance and never renew the timer. */
+                     command_text = strdup(input_text);
+                     recState = DAWN_STATE_PROCESS_COMMAND;
+                     reset_for_new_utterance(vad_ctx, asr_ctx, chunk_mgr, &silence_duration,
+                                             &speech_duration, &recording_duration,
+                                             &preroll_write_pos, &preroll_valid_bytes);
                   } else {
                      pthread_mutex_lock(&tts_mutex);
                      if (tts_playback_state == TTS_PLAYBACK_PAUSE) {
@@ -3891,6 +3913,38 @@ mqtt_disabled:
                silenceNextState = DAWN_STATE_WAKEWORD_LISTEN;
                recState = DAWN_STATE_SILENCE;
                // Reset all subsystems for new utterance
+               reset_for_new_utterance(vad_ctx, asr_ctx, chunk_mgr, &silence_duration,
+                                       &speech_duration, &recording_duration, &preroll_write_pos,
+                                       &preroll_valid_bytes);
+               break;
+            }
+
+            /* Enforce expiry again at dispatch, including the separate command-
+             * recording path. No tool or LLM can start after the window closes. */
+            if (!wake_word_window_accept(&s_voice_window, command_text, g_config.general.ai_name,
+                                         voice_monotonic_seconds())) {
+               OLOG_INFO("Local voice engagement expired; ignoring command");
+               s_voice_command_from_hold = false;
+               free(command_text);
+               command_text = NULL;
+               silenceNextState = DAWN_STATE_WAKEWORD_LISTEN;
+               recState = DAWN_STATE_SILENCE;
+               reset_for_new_utterance(vad_ctx, asr_ctx, chunk_mgr, &silence_duration,
+                                       &speech_duration, &recording_duration, &preroll_write_pos,
+                                       &preroll_valid_bytes);
+               break;
+            }
+
+            /* Only a fresh, attended local utterance can confirm a prepared power change.
+             * This route is outside the model/tool loop, after the Friday expiry gate. */
+            if (!s_command_unattended &&
+                (backpack_handle_battery_command(local_session, command_text) ||
+                 backpack_handle_host_command(local_session, command_text) ||
+                 backpack_handle_power_command(local_session, command_text))) {
+               free(command_text);
+               command_text = NULL;
+               silenceNextState = DAWN_STATE_WAKEWORD_LISTEN;
+               recState = DAWN_STATE_SILENCE;
                reset_for_new_utterance(vad_ctx, asr_ctx, chunk_mgr, &silence_duration,
                                        &speech_duration, &recording_duration, &preroll_write_pos,
                                        &preroll_valid_bytes);
@@ -4200,6 +4254,7 @@ mqtt_disabled:
    }
 
 server_shutdown:
+   backpack_notice_stop();
    OLOG_INFO("Quit.\n");
 
 #ifdef ENABLE_WEBUI

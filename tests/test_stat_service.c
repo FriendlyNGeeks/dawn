@@ -771,11 +771,163 @@ void test_interpret_since_update_dwell(void) {
    TEST_ASSERT_EQUAL_INT64(30000, since);
 }
 
+/* Extended packets remain atomic; absent slots are explicit, never guessed. */
+static void feed_pack_fixture(const char *packs) {
+   char msg[2048];
+   snprintf(msg, sizeof(msg),
+            "{\"type\":\"BatteryStatus\",\"voltage\":19.5,\"current\":2,\"power\":39,"
+            "\"battery_level\":70,\"temperature\":30,\"simulated\":true,\"packs\":%s}",
+            packs);
+   stat_service_handle_mqtt("stat/telemetry", msg, (int)strlen(msg));
+}
+
+static const char *PACKS_BOTH =
+    "[{\"id\":\"A\",\"present\":true,\"supplying\":true,\"voltage\":19.5,\"current\":2,"
+    "\"power\":39,\"battery_level\":70,\"temperature\":30},"
+    "{\"id\":\"B\",\"present\":true,\"supplying\":false,\"voltage\":19.2,\"current\":0,"
+    "\"power\":0,\"battery_level\":65,\"temperature\":28}]";
+
+void test_dual_pack_and_hot_swap(void) {
+   stat_snapshot_t s;
+   char text[2048] = "";
+   feed_pack_fixture(PACKS_BOTH);
+   stat_service_get_snapshot(&s);
+   TEST_ASSERT_EQUAL_INT(2, s.battery_pack_count);
+   TEST_ASSERT_FALSE(s.battery_stale);
+   TEST_ASSERT_TRUE(s.battery_simulated);
+   TEST_ASSERT_EQUAL_STRING("A", s.battery_packs[0].id);
+   TEST_ASSERT_TRUE(s.battery_packs[0].supplying);
+   TEST_ASSERT_FALSE(s.battery_packs[1].supplying);
+   stat_render_battery(&s, text, sizeof(text));
+   TEST_ASSERT_NOT_NULL(strstr(text, "SIMULATED"));
+   TEST_ASSERT_NOT_NULL(strstr(text, "Slot A: 70%"));
+   TEST_ASSERT_NOT_NULL(strstr(text, "Slot B: 65%"));
+   feed_pack_fixture("[{\"id\":\"A\",\"present\":false,\"supplying\":false}]");
+   stat_service_get_snapshot(&s);
+   TEST_ASSERT_EQUAL_INT(1, s.battery_pack_count);
+   TEST_ASSERT_FALSE(s.battery_packs[0].present);
+   text[0] = '\0';
+   stat_render_battery(&s, text, sizeof(text));
+   TEST_ASSERT_NOT_NULL(strstr(text, "Slot A: removed"));
+   TEST_ASSERT_NULL(strstr(text, "Slot B:")); /* unspecified is unknown */
+   feed_battery(80, 20, 30, 28);              /* legacy packets clear optional slot data */
+   stat_service_get_snapshot(&s);
+   TEST_ASSERT_EQUAL_INT(0, s.battery_pack_count);
+   TEST_ASSERT_FALSE(s.battery_simulated);
+}
+
+void test_invalid_pack_snapshot_preserves_cache(void) {
+   stat_snapshot_t s;
+   feed_pack_fixture(PACKS_BOTH);
+   const char *bad[] = { "null",
+                         "{}",
+                         "[null]",
+                         "[{\"id\":\"C\",\"present\":false,\"supplying\":false}]",
+                         "[{\"id\":\"A\",\"present\":false,\"supplying\":true}]",
+                         "[{\"id\":\"A\",\"present\":true,\"supplying\":false}]",
+                         "[{\"id\":\"A\",\"present\":false,\"supplying\":false},"
+                         "{\"id\":\"A\",\"present\":false,\"supplying\":false}]",
+                         "[{},{},{}]" };
+   for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+      feed_pack_fixture(bad[i]);
+      stat_service_get_snapshot(&s);
+      TEST_ASSERT_EQUAL_INT(2, s.battery_pack_count);
+      TEST_ASSERT_TRUE(s.battery_packs[0].present);
+   }
+   const char *partial = "{\"type\":\"BatteryStatus\",\"battery_level\":0}";
+   stat_service_handle_mqtt("stat/telemetry", partial, (int)strlen(partial));
+   stat_service_get_snapshot(&s);
+   TEST_ASSERT_EQUAL_DOUBLE(70, s.batt_level);
+}
+
+void test_battery_stale_despite_fresh_cpu(void) {
+   stat_service_shutdown();
+   stat_service_cfg_t cfg = { .enabled = true, .stale_after_sec = 1 };
+   snprintf(cfg.db_path, sizeof(cfg.db_path), "%s", TEST_DB);
+   TEST_ASSERT_EQUAL_INT(0, stat_service_init(&cfg));
+   feed_pack_fixture(PACKS_BOTH);
+   sleep(2);
+   feed_system(10, 20, 40);
+   /* Invalid battery messages must not reset battery age either. */
+   feed_pack_fixture("null");
+   stat_snapshot_t s;
+   stat_service_get_snapshot(&s);
+   TEST_ASSERT_FALSE(s.stale);
+   TEST_ASSERT_TRUE(s.battery_stale);
+   TEST_ASSERT_GREATER_OR_EQUAL_INT(2, s.battery_age_sec);
+   char text[512] = "";
+   stat_render_battery(&s, text, sizeof(text));
+   TEST_ASSERT_NOT_NULL(strstr(text, "stale"));
+   TEST_ASSERT_NULL(strstr(text, "70%"));
+   feed_battery(80, 20, 30, 28);
+   stat_service_get_snapshot(&s);
+   TEST_ASSERT_FALSE(s.battery_stale);
+}
+
+void test_brief_battery_live_and_simulated(void) {
+   stat_snapshot_t s = { .ever_seen = true,
+                         .stat_online = true,
+                         .have_battery = true,
+                         .battery_simulated = true,
+                         .batt_level = 75 };
+   char text[256];
+   stat_render_battery_brief(&s, text, sizeof(text));
+   TEST_ASSERT_EQUAL_STRING("Simulated reading. Battery is at 75 percent.", text);
+   s.battery_simulated = false;
+   s.batt_level = 42;
+   stat_render_battery_brief(&s, text, sizeof(text));
+   TEST_ASSERT_EQUAL_STRING("Battery is at 42 percent.", text);
+}
+
+void test_brief_battery_rejects_unavailable(void) {
+   for (int missing = 0; missing < 5; missing++) {
+      stat_snapshot_t s = { .ever_seen = true,
+                            .stat_online = true,
+                            .have_battery = true,
+                            .batt_level = 75 };
+      if (missing == 0)
+         s.ever_seen = false;
+      if (missing == 1)
+         s.stat_online = false;
+      if (missing == 2)
+         s.stale = true;
+      if (missing == 3)
+         s.have_battery = false;
+      if (missing == 4)
+         s.battery_stale = true;
+      char text[256];
+      stat_render_battery_brief(&s, text, sizeof(text));
+      TEST_ASSERT_EQUAL_STRING("Current battery data is unavailable or stale.", text);
+   }
+}
+
+void test_brief_battery_preserves_faults_and_bounds(void) {
+   stat_snapshot_t s = { .ever_seen = true,
+                         .stat_online = true,
+                         .have_battery = true,
+                         .batt_level = 12,
+                         .warn_faults = 1 };
+   char text[256];
+   stat_render_battery_brief(&s, text, sizeof(text));
+   TEST_ASSERT_NOT_NULL(strstr(text, "Battery warning."));
+   s.crit_faults = 1;
+   stat_render_battery_brief(&s, text, sizeof(text));
+   TEST_ASSERT_NOT_NULL(strstr(text, "Critical battery warning."));
+   char small[5] = "xxxx";
+   stat_render_battery_brief(&s, small, sizeof(small));
+   TEST_ASSERT_EQUAL_INT(0, small[4]);
+}
 int main(void) {
    test_tmp_path(TEST_DB, sizeof(TEST_DB), "dawn_stat_test.db");
    snprintf(TEST_DB_WAL, sizeof(TEST_DB_WAL), "%s-wal", TEST_DB);
    snprintf(TEST_DB_SHM, sizeof(TEST_DB_SHM), "%s-shm", TEST_DB);
    UNITY_BEGIN();
+   RUN_TEST(test_brief_battery_live_and_simulated);
+   RUN_TEST(test_brief_battery_rejects_unavailable);
+   RUN_TEST(test_brief_battery_preserves_faults_and_bounds);
+   RUN_TEST(test_dual_pack_and_hot_swap);
+   RUN_TEST(test_invalid_pack_snapshot_preserves_cache);
+   RUN_TEST(test_battery_stale_despite_fresh_cpu);
    RUN_TEST(test_topic_gating);
    RUN_TEST(test_render_primary_min_metric);
    RUN_TEST(test_render_up_carrier_not_state);

@@ -301,10 +301,22 @@ static void test_catalog_reader(void) {
    memset(&ctx, 0, sizeof(ctx));
    ctx.stat_valid = true;
    ctx.stat.have_battery = true;
+   ctx.stat.stat_online = true;
    ctx.stat.batt_level = 12.0;
    double v = 0.0;
    TEST_ASSERT_TRUE(e->read(&ctx, &v));
    TEST_ASSERT_EQUAL_DOUBLE(12.0, v);
+   ctx.stat.battery_stale = true;
+   TEST_ASSERT_FALSE(e->read(&ctx, &v));
+   ctx.stat.battery_stale = false;
+   ctx.stat.stat_online = false;
+   TEST_ASSERT_FALSE(e->read(&ctx, &v));
+   const attention_catalog_entry_t *battery_age = attention_catalog_lookup(
+       "stat.battery.telemetry");
+   TEST_ASSERT_NOT_NULL(battery_age);
+   ctx.stat.battery_age_sec = 45;
+   TEST_ASSERT_TRUE(battery_age->read(&ctx, &v)); /* age remains readable while offline */
+   TEST_ASSERT_EQUAL_DOUBLE(45.0, v);
 
    /* Source absent => not present. */
    attention_sample_ctx_t empty;

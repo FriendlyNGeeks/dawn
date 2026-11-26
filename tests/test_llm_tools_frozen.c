@@ -177,8 +177,39 @@ static void test_a_loaded_change_is_validated_once(void) {
    json_object_put(msg);
 }
 
+static void test_local_active_schemas_preserve_frozen_definitions_and_surface_gates(void) {
+   struct json_object *h = history_with_a_change();
+   llm_tools_table[2].enabled_local = false;
+   struct json_object *tools = llm_tools_request_active_openai(h, false, NULL);
+   TEST_ASSERT_NOT_NULL(tools);
+   TEST_ASSERT_EQUAL_INT(1, json_object_array_length(tools));
+   struct json_object *function, *name, *description;
+   TEST_ASSERT_TRUE(
+       json_object_object_get_ex(json_object_array_get_idx(tools, 0), "function", &function));
+   TEST_ASSERT_TRUE(json_object_object_get_ex(function, "name", &name));
+   TEST_ASSERT_EQUAL_STRING("weather", json_object_get_string(name));
+   TEST_ASSERT_TRUE(json_object_object_get_ex(function, "description", &description));
+   TEST_ASSERT_EQUAL_STRING("W", json_object_get_string(description)); /* frozen, not registry */
+   json_object_put(tools);
+   tools = llm_tools_request_active_openai(h, true, NULL);
+   TEST_ASSERT_EQUAL_INT(2, json_object_array_length(tools)); /* remote still allows job */
+   json_object_put(tools);
+   llm_tools_table[0].enabled = false;
+   TEST_ASSERT_NULL(llm_tools_request_active_openai(h, false, NULL));
+   /* Filtering never edits the stored set; re-enabling works without a new schema. */
+   llm_tools_table[0].enabled = true;
+   tools = llm_tools_request_active_openai(h, false, NULL);
+   TEST_ASSERT_EQUAL_INT(1, json_object_array_length(tools));
+   json_object_put(tools);
+   tools = llm_tools_request_tools(h, false, false, false, NULL);
+   TEST_ASSERT_EQUAL_INT(2, json_object_array_length(tools)); /* cloud contract unchanged */
+   json_object_put(tools);
+   json_object_put(h);
+}
+
 int main(void) {
    UNITY_BEGIN();
+   RUN_TEST(test_local_active_schemas_preserve_frozen_definitions_and_surface_gates);
    RUN_TEST(test_definitions_ignore_enable_flags);
    RUN_TEST(test_a_job_session_is_never_offered_a_changed_tool);
    RUN_TEST(test_a_research_session_gets_the_allowlist_only);

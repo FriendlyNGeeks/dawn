@@ -34,6 +34,7 @@
 #include <time.h>
 
 #include "config/dawn_config.h"
+#include "core/backpack_runtime.h"
 #include "core/ota.h"
 #include "core/path_utils.h"
 #include "core/rate_limiter.h"
@@ -1752,6 +1753,30 @@ int callback_http(struct lws *wsi,
             return LWS_CLOSE_CONNECTION; /* Close connection */
          }
 #endif /* ENABLE_AUTH */
+
+         /* Durable power results, protected by the same login gate as the UI. */
+         if (strcmp(path, "/api/backpack/status") == 0) {
+#ifdef ENABLE_AUTH
+            auth_session_t viewer;
+            if (!is_request_authenticated(wsi, &viewer) || !viewer.is_admin) {
+               return send_nocache_json_response(wsi, HTTP_STATUS_FORBIDDEN,
+                                                 "{\"error\":\"Administrator login required\"}");
+            }
+#else
+            return send_nocache_json_response(wsi, HTTP_STATUS_FORBIDDEN,
+                                              "{\"error\":\"Authentication required\"}");
+#endif
+            struct json_object *request = json_object_new_object();
+            json_object_object_add(request, "operation", json_object_new_string("status"));
+            struct json_object *status = backpack_runtime_request(request);
+            int result = send_nocache_json_response(
+                wsi, status ? HTTP_STATUS_OK : HTTP_STATUS_SERVICE_UNAVAILABLE,
+                status ? json_object_to_json_string_ext(status, JSON_C_TO_STRING_PLAIN)
+                       : "{\"error\":\"Backpack runtime unavailable\"}");
+            json_object_put(status);
+            json_object_put(request);
+            return result;
+         }
 
          /* Health check endpoint - returns JSON status */
          if (strcmp(path, "/health") == 0) {

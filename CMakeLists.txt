@@ -723,6 +723,7 @@ set(DAWN_SOURCES
     # Tools subsystem (web search, weather, calculator, etc.)
     src/tools/tool_registry.c
     src/tools/tools_init.c
+    src/core/backpack_runtime.c
     src/tools/hud_discovery.c
     src/tools/web_search.c
     src/tools/web_search_tavily.c

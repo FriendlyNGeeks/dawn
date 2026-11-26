@@ -65,6 +65,10 @@ static struct {
    int fan_rpm, fan_load, fan_pwm;
 
    bool have_battery;
+   struct timespec battery_seen;
+   bool battery_simulated;
+   int battery_pack_count;
+   stat_battery_pack_t battery_packs[STAT_BATTERY_MAX_PACKS];
    double batt_voltage, batt_current, batt_power, batt_level, batt_temp, time_remaining_min;
    char charging_state[24];
    char battery_status[24];
@@ -236,6 +240,55 @@ static void ingest_fan(struct json_object *root) {
 }
 
 /* --- Unified BatteryStatus --- */
+static bool parse_packs(struct json_object *root, stat_battery_pack_t *packs, int *count) {
+   struct json_object *arr;
+   *count = 0;
+   if (!json_object_object_get_ex(root, "packs", &arr)) {
+      return true; /* legacy aggregate-only publisher */
+   }
+   if (!json_object_is_type(arr, json_type_array) ||
+       json_object_array_length(arr) > STAT_BATTERY_MAX_PACKS) {
+      return false;
+   }
+   bool seen[STAT_BATTERY_MAX_PACKS] = { false };
+   for (size_t i = 0; i < json_object_array_length(arr); i++) {
+      struct json_object *p = json_object_array_get_idx(arr, i), *id, *present, *supplying;
+      if (!json_object_is_type(p, json_type_object) || !json_object_object_get_ex(p, "id", &id) ||
+          !json_object_is_type(id, json_type_string)) {
+         return false;
+      }
+      const char *name = json_object_get_string(id);
+      if (strcmp(name, "A") != 0 && strcmp(name, "B") != 0) {
+         return false;
+      }
+      int slot = name[0] - 'A';
+      if (seen[slot] || !json_object_object_get_ex(p, "present", &present) ||
+          !json_object_is_type(present, json_type_boolean) ||
+          !json_object_object_get_ex(p, "supplying", &supplying) ||
+          !json_object_is_type(supplying, json_type_boolean)) {
+         return false;
+      }
+      seen[slot] = true;
+      stat_battery_pack_t *out = &packs[(*count)++];
+      snprintf(out->id, sizeof(out->id), "%s", name);
+      out->present = json_object_get_boolean(present);
+      out->supplying = json_object_get_boolean(supplying);
+      if (!out->present) {
+         if (out->supplying)
+            return false;
+         continue;
+      }
+      if (!json_get_double(p, "voltage", &out->voltage) || out->voltage < 0 ||
+          !json_get_double(p, "current", &out->current) ||
+          !json_get_double(p, "power", &out->power) ||
+          !json_get_double(p, "battery_level", &out->level) || out->level < 0 || out->level > 100 ||
+          !json_get_double(p, "temperature", &out->temperature)) {
+         return false;
+      }
+   }
+   return true;
+}
+
 static void ingest_battery(struct json_object *root) {
    double voltage = 0, current = 0, power = 0, level = 0, temp = 0, remaining = 0;
    json_get_double(root, "voltage", &voltage);
@@ -252,10 +305,26 @@ static void ingest_battery(struct json_object *root) {
    json_get_str(root, "charging_state", charging, sizeof(charging));
    json_get_str(root, "battery_status", status, sizeof(status));
    json_get_str(root, "status_reason", reason, sizeof(reason));
+   stat_battery_pack_t packs[STAT_BATTERY_MAX_PACKS] = { 0 };
+   int pack_count;
+   /* A battery snapshot is atomic. Invalid/partial packets must not refresh its
+    * freshness or replace known readings with fabricated zeroes. */
+   if (!json_get_double(root, "voltage", &voltage) || voltage < 0 ||
+       !json_get_double(root, "current", &current) || !json_get_double(root, "power", &power) ||
+       !has_level || level < 0 || level > 100 || !json_get_double(root, "temperature", &temp) ||
+       !parse_packs(root, packs, &pack_count)) {
+      return;
+   }
+   bool simulated = false;
+   json_get_bool(root, "simulated", &simulated);
    time_t now = time(NULL);
 
    pthread_mutex_lock(&s_mutex);
    s_cache.have_battery = true;
+   clock_gettime(CLOCK_MONOTONIC, &s_cache.battery_seen);
+   s_cache.battery_simulated = simulated;
+   s_cache.battery_pack_count = pack_count;
+   memcpy(s_cache.battery_packs, packs, sizeof(packs));
    s_cache.batt_voltage = voltage;
    s_cache.batt_current = current;
    s_cache.batt_power = power;
@@ -530,6 +599,10 @@ void stat_service_get_snapshot(stat_snapshot_t *out) {
    out->fan_load = s_cache.fan_load;
    out->fan_pwm = s_cache.fan_pwm;
    out->have_battery = s_cache.have_battery;
+   struct timespec battery_seen = s_cache.battery_seen;
+   out->battery_simulated = s_cache.battery_simulated;
+   out->battery_pack_count = s_cache.battery_pack_count;
+   memcpy(out->battery_packs, s_cache.battery_packs, sizeof(out->battery_packs));
    out->batt_voltage = s_cache.batt_voltage;
    out->batt_current = s_cache.batt_current;
    out->batt_power = s_cache.batt_power;
@@ -555,6 +628,13 @@ void stat_service_get_snapshot(stat_snapshot_t *out) {
    memcpy(out->net_routes, s_cache.net_routes, sizeof(out->net_routes));
    memcpy(out->net_reach, s_cache.net_reach, sizeof(out->net_reach));
    pthread_mutex_unlock(&s_mutex);
+
+   struct timespec mono_now;
+   clock_gettime(CLOCK_MONOTONIC, &mono_now);
+   double battery_age = (double)(mono_now.tv_sec - battery_seen.tv_sec) +
+                        (double)(mono_now.tv_nsec - battery_seen.tv_nsec) / 1e9;
+   out->battery_age_sec = out->have_battery ? (int)battery_age : 0;
+   out->battery_stale = !out->have_battery || battery_age > s_cfg.stale_after_sec;
 
    time_t now = time(NULL);
    if (!out->ever_seen) {

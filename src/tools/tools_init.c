@@ -23,6 +23,7 @@
 
 #include "tools/tools_init.h"
 
+#include "core/backpack_runtime.h"
 #include "dawn_error.h"
 #include "logging.h"
 
@@ -374,6 +375,18 @@ int tools_register_all(void) {
 #endif
 
 #ifdef DAWN_ENABLE_STAT_TOOL
+   if (backpack_host_tools_register() != 0) {
+      OLOG_WARNING("Failed to register backpack host tools");
+   }
+   if (backpack_camera_tool_register() != 0) {
+      OLOG_WARNING("Failed to register backpack camera tool");
+   }
+   if (backpack_drone_tool_register() != 0) {
+      OLOG_WARNING("Failed to register drone feed tool");
+   }
+   if (backpack_power_tool_register() != 0) {
+      OLOG_WARNING("Failed to register backpack power tool");
+   }
    if (stat_tool_register() != 0) {
       OLOG_WARNING("Failed to register system_status tool");
    }

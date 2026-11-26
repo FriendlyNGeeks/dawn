@@ -86,6 +86,16 @@ typedef struct {
    bool bound;      /* probe was bound to the specific iface */
 } stat_net_reach_t;
 
+/* Optional BatteryStatus extension. A packet describes both slots completely;
+ * omitted slots are unknown, not assumed removed. No capacity averaging here. */
+#define STAT_BATTERY_MAX_PACKS 2
+typedef struct {
+   char id[2]; /* physical slot A or B */
+   bool present;
+   bool supplying;
+   double voltage, current, power, level, temperature;
+} stat_battery_pack_t;
+
 /** A consistent copy-out of the live cache (see stat_service_get_snapshot). */
 typedef struct {
    bool stat_online; /* last stat/status said "online" */
@@ -101,6 +111,11 @@ typedef struct {
    int fan_rpm, fan_load, fan_pwm;
 
    bool have_battery;
+   bool battery_stale;
+   bool battery_simulated;
+   int battery_age_sec;
+   int battery_pack_count;
+   stat_battery_pack_t battery_packs[STAT_BATTERY_MAX_PACKS];
    double batt_voltage, batt_current, batt_power, batt_level, batt_temp, time_remaining_min;
    char charging_state[24];
    char battery_status[24]; /* OK / WARNING / CRITICAL */

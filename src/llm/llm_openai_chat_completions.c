@@ -176,9 +176,13 @@ static void add_local_thinking_params(json_object *root) {
    local_provider_t provider = llm_local_get_provider();
 
    if (provider == LOCAL_PROVIDER_OLLAMA) {
-      json_object_object_add(root, "think", json_object_new_boolean(on));
-      OLOG_INFO("Local LLM (Ollama): Thinking %s (think: %s)", on ? "enabled" : "disabled",
-                on ? "true" : "false");
+      /* This request goes to /v1/chat/completions, not /api/chat. Ollama's
+       * compatibility endpoint controls thinking through reasoning_effort;
+       * the native API's boolean think field is ignored here. */
+      const char *effort = on ? (thinking.effort[0] ? thinking.effort : "medium") : "none";
+      json_object_object_add(root, "reasoning_effort", json_object_new_string(effort));
+      OLOG_INFO("Local LLM (Ollama): Thinking %s (reasoning_effort: %s)",
+                on ? "enabled" : "disabled", effort);
       return;
    }
    if (on) {
@@ -317,9 +321,13 @@ char *llm_openai_cc_chat_completion(struct json_object *conversation_history,
    if (llm_tools_enabled(NULL)) {
       /* The conversation's own tool set when it has one (llm_history_kind.h). */
       const char *source = NULL;
-      struct json_object *tools = llm_tools_request_tools(conversation_history,
-                                                          is_current_session_remote(), false, false,
-                                                          &source);
+      struct json_object *tools = api_key == NULL
+                                      ? llm_tools_request_active_openai(conversation_history,
+                                                                        is_current_session_remote(),
+                                                                        &source)
+                                      : llm_tools_request_tools(conversation_history,
+                                                                is_current_session_remote(), false,
+                                                                false, &source);
       if (tools) {
          json_object_object_add(root, "tools", tools);
          json_object_object_add(root, "tool_choice", json_object_new_string("auto"));
@@ -626,9 +634,13 @@ int llm_openai_cc_streaming_single_shot(struct json_object *conversation_history
    /* The loop's last call (iteration at the cap), for a text answer: the tools
     * stay (the request reads as every other did), none may be called. */
    if (llm_tools_enabled(NULL)) {
-      struct json_object *tools = llm_tools_request_tools(conversation_history,
-                                                          is_current_session_remote(), false, false,
-                                                          NULL);
+      struct json_object *tools = api_key == NULL
+                                      ? llm_tools_request_active_openai(conversation_history,
+                                                                        is_current_session_remote(),
+                                                                        NULL)
+                                      : llm_tools_request_tools(conversation_history,
+                                                                is_current_session_remote(), false,
+                                                                false, NULL);
       if (tools) {
          json_object_object_add(root, "tools", tools);
          json_object_object_add(root, "tool_choice",

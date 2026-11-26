@@ -227,46 +227,11 @@ static const tool_metadata_t stat_metadata = {
 
 /* ========== Formatting helpers ========== */
 
-static void fmt_duration_min(double minutes, char *out, size_t out_sz) {
-   /* Upper-bound the cast: a huge (finite) time_remaining_min from a misbehaving
-    * publisher would make (int)(minutes+0.5) an out-of-range double->int (UB).
-    * 10,000,000 min (~19 years) is well past any real battery runtime. */
-   if (minutes <= 0 || minutes > 10000000.0) {
-      snprintf(out, out_sz, "unknown");
-      return;
-   }
-   int total = (int)(minutes + 0.5);
-   int h = total / 60, m = total % 60;
-   if (h > 0) {
-      snprintf(out, out_sz, "%dh %dm", h, m);
-   } else {
-      snprintf(out, out_sz, "%dm", m);
-   }
-}
-
 static void fmt_hhmm(int64_t ts, char *out, size_t out_sz) {
    time_t t = (time_t)ts;
    struct tm tm_buf;
    localtime_r(&t, &tm_buf);
    strftime(out, out_sz, "%H:%M", &tm_buf);
-}
-
-/* Append a battery description to buf (bounded). */
-static void append_battery(const stat_snapshot_t *s, char *buf, size_t sz) {
-   char remain[32];
-   fmt_duration_min(s->time_remaining_min, remain, sizeof(remain));
-   char health[160];
-   const char *st = s->battery_status[0] ? s->battery_status : "OK";
-   if (s->crit_faults > 0 || s->warn_faults > 0) {
-      snprintf(health, sizeof(health), "health %s (%d critical, %d warning)%s%s", st,
-               s->crit_faults, s->warn_faults, s->status_reason[0] ? ": " : "", s->status_reason);
-   } else {
-      snprintf(health, sizeof(health), "health %s", st);
-   }
-   size_t off = strlen(buf);
-   snprintf(buf + off, sz - off, "Battery %.0f%% (%.1f V, %.2f A, %.1f W)%s%s, ~%s remaining, %s. ",
-            s->batt_level, s->batt_voltage, s->batt_current, s->batt_power,
-            s->charging_state[0] ? ", " : "", s->charging_state, remain, health);
 }
 
 static void append_temp(const stat_snapshot_t *s, char *buf, size_t sz) {
@@ -314,7 +279,7 @@ static int format_live(const char *action, char *buf, size_t sz) {
 
    if (strcasecmp(action, "all") == 0) {
       if (s.have_battery) {
-         append_battery(&s, buf, sz);
+         stat_render_battery(&s, buf, sz);
       }
       if (s.have_system) {
          append_temp(&s, buf, sz);
@@ -337,7 +302,7 @@ static int format_live(const char *action, char *buf, size_t sz) {
       }
    } else if (strcasecmp(action, "battery") == 0) {
       if (s.have_battery) {
-         append_battery(&s, buf, sz);
+         stat_render_battery(&s, buf, sz);
       } else {
          snprintf(buf + strlen(buf), sz - strlen(buf), "no battery data.");
       }
